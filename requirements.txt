@@ -1,0 +1,12 @@
+numpy
+pandas
+matplotlib
+seaborn
+opencv-python
+Pillow
+selenium
+pyautogui
+webdriver-manager
+tqdm
+scikit-learn
+scikit-image
