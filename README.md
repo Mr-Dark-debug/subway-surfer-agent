@@ -1,29 +1,57 @@
 # Subway Surfers Reinforcement Learning Agent
 
-A deep reinforcement learning agent that learns to play Subway Surfers directly from screen captures. This project uses a combination of computer vision, deep Q-learning, and browser automation to train an AI to master the game.
+A deep reinforcement learning agent that learns to play Subway Surfers directly from screen captures. This advanced implementation combines computer vision, deep Q-learning, and browser automation to train an AI to master the game.
 
 ![Subway Surfers RL](https://raw.githubusercontent.com/username/subway-surfers-rl/main/docs/subway_surfers_rl.png)
 
+## Overview
+
+This project implements a reinforcement learning agent that learns to play Subway Surfers by:
+- Automatically controlling the browser-based game
+- Capturing and processing screen frames in real-time
+- Adapting hyperparameters based on performance
+- Using memory-efficient algorithms for limited hardware
+- Providing detailed visualizations and evaluations
+
 ## Features
 
-- **Deep Q-Learning (DQN)** with advanced variants:
-  - Dueling DQN architecture
-  - Double DQN algorithm
-  - Prioritized Experience Replay
+### Advanced RL Algorithms
+- **Deep Q-Learning (DQN)** with state-of-the-art variants:
+  - Dueling DQN architecture for better value estimation
+  - Double DQN algorithm to reduce overestimation bias
+  - Prioritized Experience Replay for efficient learning
+  - Memory-efficient implementations optimized for 4GB VRAM
+  - Adaptive hyperparameter tuning based on performance
+
+### Computer Vision Integration
 - **Frame stacking** for temporal information
-- **Real-time game interaction** using Selenium and PyAutoGUI
-- **Computer vision** for game state analysis, including score and coin tracking
+- **CLAHE preprocessing** for improved state representation
+- **OCR and computer vision** for score and coin tracking
+- **Multi-method game over detection** for reliable episodic training
+
+### User Experience
 - **Comprehensive visualization** of training progress
-- **Split-screen mode** to observe both terminal output and gameplay simultaneously
-- **Automatic checkpointing** for resuming training
-- **Detailed reward component analysis**
+- **Split-screen mode** to observe both terminal output and gameplay
+- **Real-time decision visualization** during testing
+- **Detailed evaluation reports** with performance metrics
+- **Simple command-line interface** for training, testing, and evaluation
 
 ## Requirements
 
 - Python 3.8+
 - PyTorch 1.9+
-- CUDA-compatible GPU recommended (min. 4GB VRAM)
+- CUDA-compatible GPU recommended (works with 4GB VRAM)
 - Chrome browser
+- The following Python packages (see requirements.txt):
+  - opencv-python
+  - numpy 
+  - matplotlib
+  - selenium
+  - pytesseract
+  - pyautogui
+  - tqdm
+  - pandas
+  - seaborn
 
 ## Installation
 
@@ -49,132 +77,205 @@ A deep reinforcement learning agent that learns to play Subway Surfers directly 
    - **macOS**: `brew install tesseract`
    - **Linux**: `sudo apt install tesseract-ocr`
 
-## Configuration
+## Quick Start
 
-The code is designed to work with any browser-based version of Subway Surfers. The default URL is set to the Poki version, but you can change it in the command line arguments.
+### Training
 
-## Usage
-
-### Basic Training
-
+Start training with the simplified launcher script:
 ```bash
-python main.py --browser_position right
+python run.py
 ```
 
-This will:
-1. Open Chrome browser on the right side of your screen
-2. Navigate to Subway Surfers
-3. Train the agent with default parameters
-
-### Training with Advanced Features
-
+For advanced options:
 ```bash
-python main.py --use_dueling --use_double --use_per --browser_position right
+python run.py --episodes 500 --performance high --browser-position right
 ```
 
-This enables all advanced DQN features for better training performance.
-
-### Full Command Line Options
-
-```
-usage: main.py [-h] [--game_url GAME_URL] [--browser_position {left,right}]
-              [--max_episodes MAX_EPISODES] [--max_steps MAX_STEPS]
-              [--save_interval SAVE_INTERVAL] [--eval_interval EVAL_INTERVAL]
-              [--visual_feedback] [--use_dueling] [--use_double] [--use_per]
-              [--frame_stack FRAME_STACK] [--load_checkpoint LOAD_CHECKPOINT]
-              [--learning_rate LEARNING_RATE] [--gamma GAMMA]
-              [--batch_size BATCH_SIZE] [--target_update TARGET_UPDATE]
-              [--memory_capacity MEMORY_CAPACITY] [--epsilon_start EPSILON_START]
-              [--epsilon_end EPSILON_END] [--epsilon_decay EPSILON_DECAY]
-              [--debug] [--record_video]
-```
-
-### Common Options
-
-- `--browser_position {left,right}`: Position the browser window for split-screen viewing
-- `--max_episodes`: Maximum number of episodes for training (default: 1000)
-- `--visual_feedback`: Show visual feedback during training
-- `--debug`: Enable debug mode with extra logging and visualizations
-- `--record_video`: Record a video of gameplay after training
-- `--load_checkpoint PATH`: Path to a checkpoint file to resume training
-
-### Resume Training
-
-To resume training from a checkpoint:
-
+Or use the main script directly:
 ```bash
-python main.py --load_checkpoint logs/checkpoints/dqn_episode_100_20240417_123456.pt
+python main.py --max_episodes 500 --browser_position right --use_dueling --use_double --use_per
+```
+
+### Testing
+
+Visualize a trained agent:
+```bash
+python run.py --mode test --checkpoint models/latest.pt --visualize
+```
+
+Record a video of the agent playing:
+```bash
+python test.py --checkpoint models/latest.pt --record --show_q_values
+```
+
+### Evaluation
+
+Evaluate agent performance with detailed metrics:
+```bash
+python run.py --mode evaluate --checkpoint models/latest.pt --episodes 10
+```
+
+Compare with a previous evaluation:
+```bash
+python evaluate.py --checkpoint models/latest.pt --episodes 10 --compare evaluation_results/previous_eval
 ```
 
 ## Project Structure
 
+The project is organized into several modules:
+
 ```
-subwaysurferai/
+SubwaySurfersRL/
 ├── env/                      # Game environment code
 │   ├── game_interaction.py   # Browser & game interaction
 │   ├── capture_state.py      # Frame capture and processing
 │   └── control.py            # Keyboard controls
 │
 ├── model/                    # Deep learning models
-│   ├── dqn.py                # DQN architectures
+│   ├── dqn.py                # DQN architectures (Standard, Dueling, Efficient)
 │   ├── experience_replay.py  # Replay buffer implementations
-│   ├── agent.py              # DQN agent
-│   └── training.py           # Training loop
+│   ├── agent.py              # DQN and Adaptive agents
+│   └── training.py           # Training loop with monitoring
 │
 ├── utils/                    # Utility functions
 │   ├── utils.py              # General utilities
 │   ├── plot_utils.py         # Visualization functions
-|   |── plot.py
-│   └── reward_tracker.py     # Reward analysis tools
+│   ├── plot.py               # Additional plotting utilities
+│   ├── reward_tracker.py     # Reward analysis tools
+│   └── test.py               # Test utilities
 │
 ├── logs/                     # Training logs and checkpoints
-│   ├── checkpoints/          # Saved models
-│   └── videos/               # Gameplay recordings
+├── debug_images/             # Debug images for visualization
+├── models/                   # Trained models and results
+├── evaluation_results/       # Detailed evaluation results
+├── videos/                   # Recorded gameplay videos
 │
-├── debug_images/             # Debug screenshots and visualizations
 ├── main.py                   # Main training script
-└── README.md                 # This file
+├── run.py                    # Simple launcher script
+├── test.py                   # Test/visualization script
+├── evaluate.py               # Evaluation script
+├── requirements.txt          # Project dependencies
+└── README.md                 # Project documentation
 ```
 
-## Training Process
+## Command-Line Options
 
-1. **Environment Setup**: The system opens Chrome, positions it according to your preference, and navigates to Subway Surfers.
+### Run Script Options
 
-2. **Game Interaction**: The agent interacts with the game using keyboard controls, simulating player actions.
+```bash
+python run.py --help
+```
 
-3. **State Representation**: Game screens are captured, converted to grayscale, resized to 84x84 pixels, and stacked (default: 4 frames) to provide temporal information.
+Key options:
+- `--mode`: Choose between `train`, `test`, or `evaluate`
+- `--episodes`: Number of episodes to run
+- `--checkpoint`: Path to a saved model checkpoint
+- `--performance`: Performance profile (`low`, `medium`, `high`, or `auto`)
+- `--browser-position`: Position of browser window (`left` or `right`)
+- `--debug`: Enable debug mode with extra logging
+- `--visualize`: Enable detailed state visualization
 
-4. **Reward System**: The agent receives rewards for:
-   - Surviving (small positive reward per step)
-   - Collecting coins (larger positive reward)
-   - Increasing score (scaled positive reward)
-   - Game over (negative reward penalty)
+### Main Script Options
 
-5. **Learning**: The DQN algorithm with experience replay learns to maximize these rewards through trial and error.
+```bash
+python main.py --help
+```
 
-6. **Evaluation**: Periodically, the agent is evaluated without exploration to assess its performance.
+Key options:
+- `--max_episodes`: Maximum number of episodes to train for
+- `--max_steps`: Maximum steps per episode
+- `--save_interval`: Save checkpoint every N episodes
+- `--eval_interval`: Evaluate agent every N episodes
+- `--use_dueling`: Use Dueling DQN architecture
+- `--use_double`: Use Double DQN algorithm
+- `--use_per`: Use Prioritized Experience Replay
+- `--frame_stack`: Number of frames to stack
+- `--memory_efficient`: Use memory-efficient implementations
+- `--adaptive`: Use adaptive hyperparameter tuning
 
-## Debugging and Troubleshooting
+## Performance Tips
 
-If you encounter issues with game detection or interaction:
+1. **Hardware Recommendations**:
+   - GPU with 4GB+ VRAM provides best performance
+   - At least 8GB system RAM recommended
+   - Modern multi-core CPU for game rendering and state processing
 
-1. Enable debug mode with `--debug` to generate detailed logs and debug images
-2. Check the `debug_images/` directory for visual diagnostics
-3. Adjust the browser position if the game is not detected properly
-4. Ensure your screen resolution is sufficient for split-screen viewing
+2. **Optimizing Training**:
+   - Start with `--performance auto` to automatically detect optimal settings
+   - Use `--memory_efficient` on systems with limited VRAM
+   - Reduce `--frame_stack` to 3 on very limited systems
 
-## Common Issues
+3. **Browser Settings**:
+   - Ensure Chrome browser is up-to-date
+   - Close other browser windows to reduce resource usage
+   - Position the game window where it has clear visibility (`--browser-position right`)
 
-- **Game not starting**: Try running with `--debug` to see why the game isn't loading correctly
-- **Poor performance**: Ensure your GPU is being utilized by checking the logs
-- **Browser positioning**: If split-screen doesn't work well, try adjusting your display settings
+## Understanding Results
 
-## Future Improvements
+The agent produces several types of outputs:
 
-- Support for other versions of Subway Surfers
-- Implementation of additional RL algorithms (A3C, PPO)
-- Transfer learning from pre-trained models
-- More sophisticated computer vision for better game state detection
+1. **Training Logs**: Found in `logs/` directory, showing rewards, losses, and other metrics
+
+2. **Checkpoints**: Saved in `logs/checkpoints/` with a copy in `models/` for the latest version
+
+3. **Debug Images**: Stored in `debug_images/` showing game frames, states, and OCR detection
+
+4. **Evaluation Reports**: Comprehensive HTML reports in `evaluation_results/` with:
+   - Performance metrics (rewards, scores, episode lengths)
+   - Action distribution analysis
+   - Reward component breakdown
+   - Comparison with previous evaluations
+   - Visualizations and plots
+
+## Customization
+
+You can customize the screen regions for game detection by modifying the constants in `env/game_interaction.py`:
+
+```python
+self.game_region = (1094, 178, 806, 529)    # (x, y, width, height)
+self.score_region = (1682, 159, 225, 48)    # (x, y, width, height)
+self.coin_region = (1682, 217, 225, 48)     # (x, y, width, height)
+```
+
+For testing different region settings without modifying the code, use:
+```bash
+python utils/test.py
+```
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Game not detected**:
+   - Verify screen regions in `env/game_interaction.py`
+   - Use `utils/test.py` to visualize and adjust regions
+
+2. **OCR failures**:
+   - Ensure Tesseract OCR is properly installed
+   - Check debug images in `debug_images/scores/` and `debug_images/coins/`
+
+3. **Browser issues**:
+   - Update Chrome to the latest version
+   - Try `--browser-position left` if right doesn't work
+   - Check if `selenium` and `webdriver-manager` are up-to-date
+
+4. **Memory errors**:
+   - Use `--memory_efficient` flag
+   - Reduce `--batch_size` to 16 or lower
+   - Decrease `--memory_capacity` to 5000
+
+### Debug Mode
+
+For detailed debugging information:
+```bash
+python run.py --debug
+```
+
+This enables:
+- Verbose logging
+- Saving of debug images
+- Detailed error messages
+- Performance statistics
 
 ## License
 
@@ -185,3 +286,4 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - OpenAI Gym for inspiration on environment design
 - DeepMind for their pioneering work on DQN
 - Poki for providing a browser-based version of Subway Surfers
+- Game: (1094, 178, 806. 529) Score: (1682, 159.,225, 48) Coins: (1682, 217, 225, 48)

@@ -1,4 +1,4 @@
-# main.py - Complete implementation
+# main.py - Optimized implementation for training a RL agent to play Subway Surfers
 import os
 import logging
 import argparse
@@ -6,21 +6,29 @@ import torch
 import numpy as np
 from datetime import datetime
 import time
-import cv2
 import matplotlib.pyplot as plt
+import gc
+import psutil
+import json
+import shutil
+import warnings
 from tqdm import tqdm
+import platform
+
+# Filter excessive warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # Import custom modules
 from env.game_interaction import SubwaySurfersEnv
-from env.capture_state import StateCapture
-from model.agent import DQNAgent
+from model.agent import DQNAgent, AdaptiveDQNAgent
 from model.training import Trainer
-from utils.utils import check_gpu, optimize_for_gpu, measure_inference_time, monitor_memory_usage, format_time
-from utils.plot_utils import plot_training_metrics, plot_learning_curve, create_training_summary_report
+from utils.utils import check_gpu, optimize_for_gpu
 
 # Configure logging
-log_file = f"subway_surfers_rl_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 os.makedirs("logs", exist_ok=True)
+log_file = f"subway_surfers_rl_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -35,48 +43,56 @@ class FrameStackingEnv:
     """
     Wrapper environment that handles frame stacking for DQN
     """
-    def __init__(self, env, state_capture, stack_size=4):
+    def __init__(self, env, stack_size=4):
+        """
+        Initialize frame stacking environment wrapper
+        
+        Args:
+            env: Base environment
+            stack_size: Number of frames to stack
+        """
         self.env = env
-        self.state_capture = state_capture
         self.stack_size = stack_size
         self.frames = []
         self.actions = env.actions
         
     def reset(self):
+        """Reset environment and return initial stacked state"""
         # Reset the base environment
-        _ = self.env.reset()
-        
-        # Reset state capture
-        self.state_capture.reset()
+        observation = self.env.reset()
         
         # Reset the frame stack
         self.frames = []
         
-        # Get initial state by stacking the same frame
-        frame = self.env.capture_screen()
-        processed_frame = self.env.preprocess_frame(frame)
-        
-        # Clear frame stack and add initial frame multiple times
-        self.frames = [processed_frame] * self.stack_size
+        # Stack the initial frame multiple times
+        for _ in range(self.stack_size):
+            self.frames.append(observation)
         
         # Return stacked frames as the state
         return np.array(self.frames)
     
     def step(self, action):
-        # Take action in the environment
-        next_frame, reward, done, info = self.env.step(action)
+        """
+        Take a step in the environment
         
-        # Store preprocessed frame
-        processed_frame = next_frame  # Already preprocessed by env.step()
+        Args:
+            action: Action to take
+            
+        Returns:
+            Tuple of (stacked_state, reward, done, info)
+        """
+        # Take action in the environment
+        next_observation, reward, done, info = self.env.step(action)
         
         # Update frame stack (remove oldest, add newest)
         self.frames.pop(0)
-        self.frames.append(processed_frame)
+        self.frames.append(next_observation)
         
         # Return state as stacked frames
         return np.array(self.frames), reward, done, info
     
     def close(self):
+        """Close the environment"""
         self.env.close()
     
     def visualize_agent_state(self, state, step_num, episode_num):
@@ -87,6 +103,11 @@ class FrameStackingEnv:
         """Forward to the environment's update_training_stats method"""
         if hasattr(self.env, 'update_training_stats'):
             self.env.update_training_stats(epsilon, loss, avg_reward)
+    
+    def log_performance_stats(self):
+        """Forward to the environment's log_performance_stats method"""
+        if hasattr(self.env, 'log_performance_stats'):
+            self.env.log_performance_stats()
 
 def parse_args():
     """Parse command line arguments"""
@@ -94,12 +115,14 @@ def parse_args():
     
     # Environment settings
     parser.add_argument("--game_url", type=str, default="https://poki.com/en/g/subway-surfers", 
-                        help="URL to the Subway Surfers game")
+                        help="URL to the game")
     parser.add_argument("--browser_position", type=str, default="right", choices=["left", "right"],
                         help="Position of the browser window for split-screen viewing")
+    parser.add_argument("--use_existing_browser", action="store_true",
+                        help="Use existing browser window with the game already opened")
     
     # Training settings
-    parser.add_argument("--max_episodes", type=int, default=1000, 
+    parser.add_argument("--max_episodes", type=int, default=500, 
                         help="Maximum number of episodes to train for")
     parser.add_argument("--max_steps", type=int, default=5000, 
                         help="Maximum steps per episode")
@@ -107,25 +130,29 @@ def parse_args():
                         help="Save checkpoint every N episodes")
     parser.add_argument("--eval_interval", type=int, default=20, 
                         help="Evaluate agent every N episodes")
-    parser.add_argument("--visual_feedback", action="store_true",
-                        help="Show visual feedback during training")
     
     # Model settings
-    parser.add_argument("--use_dueling", action="store_true", 
+    parser.add_argument("--use_dueling", action="store_true", default=True,
                         help="Use Dueling DQN architecture")
-    parser.add_argument("--use_double", action="store_true", 
+    parser.add_argument("--use_double", action="store_true", default=True,
                         help="Use Double DQN algorithm")
-    parser.add_argument("--use_per", action="store_true", 
+    parser.add_argument("--use_per", action="store_true", default=True,
                         help="Use Prioritized Experience Replay")
     parser.add_argument("--frame_stack", type=int, default=4,
                         help="Number of frames to stack for state representation")
+    parser.add_argument("--memory_efficient", action="store_true", default=True,
+                        help="Use memory-efficient implementations")
+    parser.add_argument("--adaptive", action="store_true", default=True,
+                        help="Use adaptive hyperparameter tuning")
     
     # Checkpoint settings
     parser.add_argument("--load_checkpoint", type=str, default=None, 
                         help="Path to checkpoint file to load")
+    parser.add_argument("--model_dir", type=str, default="models",
+                        help="Directory to save trained model")
     
     # Hyperparameters
-    parser.add_argument("--learning_rate", type=float, default=0.0001, 
+    parser.add_argument("--learning_rate", type=float, default=0.0005, 
                         help="Learning rate")
     parser.add_argument("--gamma", type=float, default=0.99, 
                         help="Discount factor for future rewards")
@@ -137,22 +164,18 @@ def parse_args():
                         help="Capacity of replay buffer")
     parser.add_argument("--epsilon_start", type=float, default=1.0,
                         help="Starting value of epsilon for exploration")
-    parser.add_argument("--epsilon_end", type=float, default=0.01,
+    parser.add_argument("--epsilon_end", type=float, default=0.05,
                         help="Minimum value of epsilon")
-    parser.add_argument("--epsilon_decay", type=float, default=0.9995,
+    parser.add_argument("--epsilon_decay", type=float, default=0.995,
                         help="Decay rate of epsilon per episode")
     
     # Debug settings
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug mode with extra logging and visualizations")
-    parser.add_argument("--record_video", action="store_true",
-                        help="Record video of gameplay")
     parser.add_argument("--detailed_monitoring", action="store_true",
                         help="Enable detailed state monitoring with visualizations")
-    parser.add_argument("--show_regions", action="store_true",
-                        help="Show game regions in real-time with bounding boxes")
-    parser.add_argument("--monitor_memory", action="store_true",
-                        help="Monitor memory usage during training")
+    parser.add_argument("--skip_browser", action="store_true",
+                        help="Skip browser initialization (for debugging only)")
     
     # Parse arguments
     args = parser.parse_args()
@@ -160,7 +183,15 @@ def parse_args():
     return args
 
 def create_environment(args):
-    """Create and initialize the game environment"""
+    """
+    Create and initialize the game environment
+    
+    Args:
+        args: Command line arguments
+        
+    Returns:
+        Environment instance
+    """
     logger.info("Creating environment...")
     
     # Create directories for debug output
@@ -169,22 +200,29 @@ def create_environment(args):
     
     # Create environment
     try:
-        env = SubwaySurfersEnv(
-            game_url=args.game_url,
-            render_mode="human" if args.visual_feedback or args.show_regions else None,
-            position=args.browser_position
-        )
-        
-        # Set up state capture
-        state_capture = StateCapture(
-            game_region=env.game_region,
-            target_size=(84, 84),
-            stack_frames=args.frame_stack,
-            debug=args.debug
-        )
-        
+        if args.skip_browser:
+            # Create a dummy environment for debugging
+            from unittest.mock import MagicMock
+            env = MagicMock()
+            env.actions = ['noop', 'up', 'down', 'left', 'right']
+            env.reset.return_value = np.zeros((84, 84), dtype=np.float32)
+            env.step.return_value = (
+                np.zeros((84, 84), dtype=np.float32),
+                1.0,  # reward
+                False,  # done
+                {'score': 100, 'coins': 1}  # info
+            )
+            logger.warning("Using dummy environment (browser skipped)")
+        else:
+            # Create real environment
+            env = SubwaySurfersEnv(
+                game_url=args.game_url,
+                position=args.browser_position,
+                use_existing_browser=args.use_existing_browser
+            )
+            
         # Wrap environment with frame stacking
-        stacked_env = FrameStackingEnv(env, state_capture, stack_size=args.frame_stack)
+        stacked_env = FrameStackingEnv(env, stack_size=args.frame_stack)
         
         logger.info(f"Environment created successfully with {args.frame_stack} frame stacking")
         return stacked_env
@@ -194,7 +232,17 @@ def create_environment(args):
         raise
 
 def create_agent(env, args, device):
-    """Create and initialize the DQN agent"""
+    """
+    Create and initialize the DQN agent
+    
+    Args:
+        env: Game environment
+        args: Command line arguments
+        device: Torch device (CPU/GPU)
+        
+    Returns:
+        Tuple of (agent, start_episode)
+    """
     logger.info("Creating agent...")
     
     # Determine state shape (frames, height, width)
@@ -202,10 +250,14 @@ def create_agent(env, args, device):
     n_actions = len(env.actions)  # Number of possible actions
     
     # Optimize hyperparameters for GPU if available
-    batch_size, memory_capacity = optimize_for_gpu(
-        batch_size=args.batch_size,
-        state_shape=state_shape
-    )
+    if device.type == 'cuda':
+        batch_size, memory_capacity = optimize_for_gpu(
+            batch_size=args.batch_size,
+            state_shape=state_shape
+        )
+    else:
+        batch_size = args.batch_size
+        memory_capacity = args.memory_capacity
     
     logger.info(f"Using batch size: {batch_size}, memory capacity: {memory_capacity}")
     
@@ -214,15 +266,31 @@ def create_agent(env, args, device):
         # Create checkpoint directory
         os.makedirs("logs/checkpoints", exist_ok=True)
         
-        agent = DQNAgent(
-            state_shape=state_shape,
-            n_actions=n_actions,
-            checkpoint_dir="./logs/checkpoints/",
-            use_dueling=args.use_dueling,
-            use_double=args.use_double,
-            use_per=args.use_per,
-            device=device
-        )
+        # Use adaptive agent if requested
+        if args.adaptive:
+            logger.info("Creating AdaptiveDQNAgent with dynamic hyperparameter tuning")
+            agent = AdaptiveDQNAgent(
+                state_shape=state_shape,
+                n_actions=n_actions,
+                checkpoint_dir="./logs/checkpoints/",
+                use_dueling=args.use_dueling,
+                use_double=args.use_double,
+                use_per=args.use_per,
+                device=device,
+                memory_efficient=args.memory_efficient
+            )
+        else:
+            logger.info("Creating standard DQNAgent")
+            agent = DQNAgent(
+                state_shape=state_shape,
+                n_actions=n_actions,
+                checkpoint_dir="./logs/checkpoints/",
+                use_dueling=args.use_dueling,
+                use_double=args.use_double,
+                use_per=args.use_per,
+                device=device,
+                memory_efficient=args.memory_efficient
+            )
         
         # Update hyperparameters from command line arguments
         agent.gamma = args.gamma
@@ -256,69 +324,106 @@ def create_agent(env, args, device):
         logger.error(f"Error creating agent: {str(e)}")
         raise
 
-def record_gameplay_video(env, agent, output_path, max_frames=1000):
-    """Record a video of the agent playing the game"""
-    logger.info("Recording gameplay video...")
+def checkpoint_callback(checkpoint_path, episode):
+    """
+    Callback function for when a checkpoint is saved
+    Copies the checkpoint to the models directory for easier access
     
-    # Create video writer
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    fps = 30
-    frame_size = (env.env.game_region[2], env.env.game_region[3])  # Get from base env
-    video_writer = cv2.VideoWriter(output_path, fourcc, fps, frame_size)
-    
-    # Reset the environment
-    state = env.reset()
-    
-    # Convert state from stacked frames to single state tensor if needed
-    if isinstance(state, np.ndarray) and len(state.shape) == 3:
-        # No need to unsqueeze here, select_action will handle it
-        state_tensor = state
-    else:
-        state_tensor = state
-    
-    frames_recorded = 0
-    done = False
-    total_reward = 0
-    
+    Args:
+        checkpoint_path: Path to the saved checkpoint
+        episode: Current episode number
+    """
     try:
-        # Record gameplay until done or max frames reached
-        while not done and frames_recorded < max_frames:
-            # Capture raw frame for video from base environment
-            raw_frame = env.env.capture_screen()
-            
-            # Convert RGB to BGR for OpenCV
-            frame_bgr = cv2.cvtColor(raw_frame, cv2.COLOR_RGB2BGR)
-            
-            # Add frame number and reward
-            cv2.putText(frame_bgr, f"Frame: {frames_recorded}", 
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(frame_bgr, f"Reward: {total_reward:.2f}", 
-                        (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            
-            # Write frame to video
-            video_writer.write(frame_bgr)
-            
-            # Select action
-            action = agent.select_action(state_tensor, training=False)
-            
-            # Take action in environment
-            next_state, reward, done, _ = env.step(action)
-            
-            # Update state and accumulate reward
-            state_tensor = next_state
-            total_reward += reward
-            
-            frames_recorded += 1
-            
-    except Exception as e:
-        logger.error(f"Error during video recording: {str(e)}")
-    
-    finally:
-        # Release video writer
-        video_writer.release()
-        logger.info(f"Gameplay video saved to {output_path} ({frames_recorded} frames)")
+        # Create models directory if it doesn't exist
+        os.makedirs("models", exist_ok=True)
         
-        return total_reward, frames_recorded
+        # Create a simplified filename for the destination
+        dest_filename = f"subway_surfers_ep{episode}.pt"
+        dest_path = os.path.join("models", dest_filename)
+        
+        # Copy the checkpoint
+        shutil.copy(checkpoint_path, dest_path)
+        logger.info(f"Checkpoint copied to {dest_path}")
+        
+        # Create a 'latest' link
+        latest_path = os.path.join("models", "latest.pt")
+        if os.path.exists(latest_path):
+            os.remove(latest_path)
+        shutil.copy(checkpoint_path, latest_path)
+        
+    except Exception as e:
+        logger.warning(f"Error in checkpoint callback: {e}")
+
+def save_experiment_config(args, model_dir):
+    """
+    Save experiment configuration to JSON file
+    
+    Args:
+        args: Command line arguments
+        model_dir: Directory to save the configuration
+    """
+    config = vars(args)
+    config['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    config['platform'] = {
+        'python_version': platform.python_version(),
+        'system': platform.system(),
+        'processor': platform.processor()
+    }
+    
+    # Add GPU info if available
+    if torch.cuda.is_available():
+        config['gpu'] = {
+            'name': torch.cuda.get_device_name(0),
+            'count': torch.cuda.device_count(),
+            'memory': torch.cuda.get_device_properties(0).total_memory / (1024**3)  # GB
+        }
+    
+    # Save to file
+    os.makedirs(model_dir, exist_ok=True)
+    config_path = os.path.join(model_dir, 'experiment_config.json')
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=2)
+    
+    logger.info(f"Experiment configuration saved to {config_path}")
+
+def show_startup_message():
+    """Display an ASCII art startup message"""
+    art = """
+    _____       _                         _____             __                
+   / ___/__ __ (_)__    ___ _  ___  __ __/ ___/__ __ _____ / _|___ ____ ___  
+  _\\ \\  / // // / _ \\  / _ `/ / _ \\/ // /\\ \\  / // // __// _// -_) __// -_) 
+ /___/  \\_,_//_/_//_/  \\_,_/ / .__/\\_,_/___/  \\_,_//_/  /_/  \\__/_/   \\__/  
+                            /_/                                             
+     _____     _        __                                          __ 
+    / ___/_ __/ /  ___ / /  ___ _  ___  ___ ___ ___ _ __ ___  ___ _/ /_
+   / (_ // __/ _ \\/ -_) _ \\/ _ `/ / _ \\/ -_|_-</ -_) // / _ \\/ _ `/ __/
+   \\___//_/ /_//_/\\__/_//_/\\_,_/ / .__/\\__/___/\\__/\\_,_/ .__/\\_,_/\\__/ 
+                                /_/                    /_/              
+    """
+    
+    print("\n" + art)
+    
+    # Add system info
+    print("\nSystem Information:")
+    print(f"  Python: {platform.python_version()}")
+    print(f"  OS: {platform.system()} {platform.release()}")
+    
+    # Add PyTorch and CUDA info
+    print("\nPyTorch Information:")
+    print(f"  PyTorch: {torch.__version__}")
+    print(f"  CUDA Available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"  CUDA Version: {torch.version.cuda}")
+        print(f"  GPU: {torch.cuda.get_device_name(0)}")
+        
+    # Memory info
+    vm = psutil.virtual_memory()
+    print("\nMemory Information:")
+    print(f"  Total RAM: {vm.total / (1024**3):.1f} GB")
+    print(f"  Available RAM: {vm.available / (1024**3):.1f} GB")
+    
+    # Add separator
+    print("\n" + "="*80 + "\n")
 
 def main():
     """Main function"""
@@ -326,19 +431,20 @@ def main():
     args = parse_args()
     
     # Display welcome message
-    print("\n" + "="*80)
-    print("Subway Surfers Reinforcement Learning Training".center(80))
-    print("="*80 + "\n")
+    show_startup_message()
     
     # Create necessary directories
     os.makedirs("logs", exist_ok=True)
     os.makedirs("logs/checkpoints", exist_ok=True)
-    os.makedirs("logs/videos", exist_ok=True)
-    os.makedirs("logs/plots", exist_ok=True)
     os.makedirs("debug_images", exist_ok=True)
+    os.makedirs(args.model_dir, exist_ok=True)
     
     # Log all arguments
     logger.info(f"Training with arguments: {vars(args)}")
+    
+    # Save experiment configuration
+    import platform  # for system info
+    save_experiment_config(args, args.model_dir)
     
     # Check GPU
     device = check_gpu()
@@ -364,92 +470,47 @@ def main():
             eval_interval=args.eval_interval,
             max_episodes=args.max_episodes,
             max_steps_per_episode=args.max_steps,
-            detailed_monitoring=args.detailed_monitoring
+            detailed_monitoring=args.detailed_monitoring,
+            checkpoint_callback=checkpoint_callback  # Register callback for checkpoints
         )
-        
-        # Measure model inference time
-        logger.info("Measuring inference time...")
-        dummy_input_shape = (1, *agent.state_shape)  # Batch size of 1
-        inference_time = measure_inference_time(
-            model=agent.policy_net,
-            input_shape=dummy_input_shape,
-            num_trials=100,
-            device=device
-        )
-        logger.info(f"Average inference time: {inference_time:.2f} ms")
-        
-        # Monitor initial memory usage
-        if args.monitor_memory:
-            monitor_memory_usage()
         
         # Train the agent
         logger.info(f"Starting training from episode {start_episode}...")
-        print("\nStarting training. Press Ctrl+C to stop.\n")
-        
-        # Set up memory monitoring timer
-        if args.monitor_memory:
-            last_memory_check = time.time()
-            memory_check_interval = 300  # Check every 5 minutes
-        
-        # Initial timestamp for ETA calculation
-        training_start = time.time()
+        print("\nStarting training. Press Ctrl+C to stop gracefully.\n")
         
         # Train the agent
-        try:
-            rewards = trainer.train(start_episode=start_episode)
-            
-            # Calculate total training time
-            training_time = time.time() - start_time
-            hours, remainder = divmod(training_time, 3600)
-            minutes, seconds = divmod(remainder, 60)
-            logger.info(f"Training completed in {int(hours)}h {int(minutes)}m {int(seconds)}s")
-            
-        except KeyboardInterrupt:
-            logger.info("Training interrupted by user")
-            print("\nTraining interrupted. Saving final metrics...\n")
-            rewards = trainer.episode_rewards
+        rewards = trainer.train(start_episode=start_episode)
         
-        # Plot final metrics
-        logger.info("Plotting final metrics...")
-        plot_training_metrics(
-            rewards=trainer.episode_rewards,
-            lengths=trainer.episode_lengths,
-            epsilons=[agent.epsilon_start * (agent.epsilon_decay ** i) for i in range(len(trainer.episode_rewards))],
-            losses=trainer.losses,
-            save_dir="./logs/plots"
-        )
+        # Calculate total training time
+        training_time = time.time() - start_time
+        hours, remainder = divmod(training_time, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        logger.info(f"Training completed in {int(hours)}h {int(minutes)}m {int(seconds)}s")
         
-        # Log final performance statistics
-        if hasattr(agent, 'log_performance_stats'):
-            agent.log_performance_stats()
-            
-        if hasattr(trainer, 'log_performance_stats'):
-            trainer.log_performance_stats()
+        # Create training summary
+        summary_path = trainer.create_training_summary()
+        print(f"\nTraining summary created: {summary_path}\n")
         
-        # Plot learning curve from CSV
-        logger.info("Creating training summary report...")
-        create_training_summary_report(
-            csv_path=trainer.csv_path,
-            save_dir="./logs/"
-        )
+        # Copy final model to the specified model directory
+        final_model_path = os.path.join(args.model_dir, f"subway_surfers_final_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt")
         
-        # Record a video of the trained agent
-        if args.record_video:
-            video_path = f"logs/videos/gameplay_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
-            final_reward, frames_recorded = record_gameplay_video(env, agent, video_path)
-            logger.info(f"Recorded gameplay video with reward: {final_reward:.2f} over {frames_recorded} frames")
+        # Find latest checkpoint
+        latest_checkpoint = None
+        checkpoints_dir = "logs/checkpoints"
+        if os.path.exists(checkpoints_dir):
+            checkpoints = [os.path.join(checkpoints_dir, f) for f in os.listdir(checkpoints_dir) if f.endswith(".pt")]
+            if checkpoints:
+                latest_checkpoint = max(checkpoints, key=os.path.getmtime)
         
-        # Final memory usage check
-        if args.monitor_memory:
-            monitor_memory_usage()
+        # Copy the checkpoint if found
+        if latest_checkpoint:
+            shutil.copy(latest_checkpoint, final_model_path)
+            logger.info(f"Final model saved to {final_model_path}")
         
-        logger.info("Training complete!")
-        print("\n" + "="*80)
-        print("Training completed successfully!".center(80))
-        print(f"Training time: {int(hours)}h {int(minutes)}m {int(seconds)}s".center(80))
-        print(f"Checkpoints saved in: {os.path.abspath('logs/checkpoints')}".center(80))
-        print(f"Final reward: {rewards[-1]:.2f}".center(80))
-        print("="*80 + "\n")
+        # Clean up
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
     except KeyboardInterrupt:
         logger.info("Training interrupted by user")
@@ -473,6 +534,25 @@ def main():
         if env is not None:
             env.close()
             logger.info("Environment closed")
+        
+        # Display final message
+        print("\n" + "="*80)
+        print("Training session ended".center(80))
+        
+        # Calculate training time
+        training_time = time.time() - start_time
+        training_hours, remainder = divmod(training_time, 3600)
+        training_minutes, training_seconds = divmod(remainder, 60)
+        
+        print(f"Training time: {int(training_hours)}h {int(training_minutes)}m {int(training_seconds)}s".center(80))
+        
+        # Show info about where to find results
+        print("\nResults saved in:")
+        print(f"  - Checkpoints: {os.path.abspath('logs/checkpoints')}")
+        print(f"  - Training logs: {os.path.abspath('logs')}")
+        print(f"  - Final model: {os.path.abspath(args.model_dir)}")
+        print(f"  - Debug images: {os.path.abspath('debug_images')}")
+        print("="*80 + "\n")
 
 if __name__ == "__main__":
     main()

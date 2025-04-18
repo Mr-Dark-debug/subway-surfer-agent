@@ -6,7 +6,7 @@ import csv
 import time
 from datetime import datetime
 import logging
-
+import sys
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,

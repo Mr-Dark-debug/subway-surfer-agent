@@ -1,0 +1,54 @@
+================================================================================
+                       SUBWAY SURFERS RL TRAINING SUMMARY                       
+================================================================================
+
+Date: 2025-04-18 16:57:44
+Total Training Time: 0h 0m 3s
+
+TRAINING METRICS
+--------------------------------------------------------------------------------
+Episodes Completed: 5 of 500
+Total Environment Steps: 5
+
+PERFORMANCE
+--------------------------------------------------------------------------------
+Final Episode Reward: -2.40
+Best Episode Reward: -1.90
+Average Episode Reward: -2.30
+
+
+EPISODE LENGTHS
+--------------------------------------------------------------------------------
+Average Episode Length: 1.00 steps
+Longest Episode: 1 steps
+Shortest Episode: 1 steps
+
+REWARD COMPONENTS
+--------------------------------------------------------------------------------
+Survival Rewards: 0.10
+Score Rewards: 2.60
+Coin Rewards: 0.00
+Penalty Rewards: -5.00
+Time Rewards: 0.00
+
+TIMING METRICS
+--------------------------------------------------------------------------------
+Average Episode Time: 0.66s (±0.30s)
+Average Step Time: 657.54ms (±302.64ms)
+Average Learn Time: 0.00ms (±0.00ms)
+
+MEMORY USAGE
+--------------------------------------------------------------------------------
+Average RAM Usage: 653.41MB (max: 654.38MB)
+Average GPU Memory: 3.12MB (max: 3.12MB)
+
+MODEL INFORMATION
+--------------------------------------------------------------------------------
+Model Parameters: 408,742
+Final Epsilon: 0.9752
+Using Dueling DQN: Yes
+Using Double DQN: Yes
+Using Prioritized Experience Replay: Yes
+Memory Efficiency Optimizations: Yes
+
+================================================================================

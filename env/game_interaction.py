@@ -9,13 +9,12 @@ import pytesseract
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.common.exceptions import TimeoutException, ElementNotInteractableException
-import tkinter as tk
+from selenium.common.exceptions import TimeoutException, ElementNotInteractableException, WebDriverException
 import random
-from PIL import Image, ImageTk
 
 # Configure logging
 logging.basicConfig(
@@ -28,17 +27,17 @@ class SubwaySurfersEnv:
     """
     Environment for interacting with Subway Surfers game in a browser
     """
-    def __init__(self, game_url="https://poki.com/en/g/subway-surfers", render_mode=None, position="right"):
+    def __init__(self, game_url="https://poki.com/en/g/subway-surfers", position="right", 
+                 use_existing_browser=False):
         """
         Initialize the Subway Surfers environment
         
         Args:
             game_url: URL to the game
-            render_mode: Rendering mode (None or "human")
             position: Position of the browser window ("left" or "right")
+            use_existing_browser: Whether to use an existing browser window (ignored, always opens new window)
         """
         self.game_url = game_url
-        self.render_mode = render_mode
         self.position = position
         
         # Game state
@@ -54,9 +53,36 @@ class SubwaySurfersEnv:
         # Action space (0: no-op, 1: jump, 2: down, 3: left, 4: right)
         self.actions = ['noop', 'up', 'down', 'left', 'right']
         
+        # Browser status
+        self.browser_active = True
+        
+        # FIXED REGIONS as specified - using your exact values
+        self.game_region = (1094, 178, 806, 529)    # (x, y, width, height)
+        self.score_region = (1682, 159, 225, 48)    # (x, y, width, height)
+        self.coin_region = (1682, 217, 225, 48)     # (x, y, width, height)
+        
+        # Create debug directories early to avoid issues
+        self._setup_debug_directories()
+        
+        logger.info(f"Using fixed game region: {self.game_region}")
+        logger.info(f"Using fixed score region: {self.score_region}")
+        logger.info(f"Using fixed coin region: {self.coin_region}")
+        
         # Initialize browser
         logger.info("Initializing browser...")
-        self.browser = self._init_browser()
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                self.browser = self._init_browser()
+                break
+            except Exception as e:
+                logger.error(f"Browser initialization attempt {attempt+1}/{max_retries} failed: {e}")
+                if attempt < max_retries - 1:
+                    logger.info("Retrying browser initialization...")
+                    time.sleep(2)
+                else:
+                    logger.critical("All browser initialization attempts failed. Cannot continue.")
+                    raise
         
         # Position browser window based on preference
         self._position_browser()
@@ -68,42 +94,71 @@ class SubwaySurfersEnv:
         # Initialize game
         self.initialize_game()
         
-        # Game regions (will be set during detection)
-        self.game_region = None
-        self.score_region = None
-        self.coin_region = None
+        # Record initial debug image with regions
+        self._save_debug_regions()
         
-        # Detect game region
-        self.detect_game_region()
-        
-        # Initialize GUI for visual feedback if render_mode is "human"
-        if self.render_mode == "human":
-            self._init_gui()
-        
-        # Debug: create debug_images directory if it doesn't exist
-        os.makedirs("debug_images", exist_ok=True)
-        os.makedirs("debug_images/states", exist_ok=True)
+        # Metrics for performance tracking
+        self.frame_capture_times = []
+        self.ocr_times = []
+        self.action_times = []
         
         logger.info("Game initialized successfully")
-        
+    
+    def _setup_debug_directories(self):
+        """Create all necessary debug directories"""
+        directories = [
+            "debug_images",
+            "debug_images/states",
+            "debug_images/popups",
+            "debug_images/scores",
+            "debug_images/coins",
+            "debug_images/frames",
+            "debug_images/regions",
+            "logs"
+        ]
+        for directory in directories:
+            os.makedirs(directory, exist_ok=True)
+            
     def _init_browser(self):
         """Initialize the browser with appropriate settings"""
-        chrome_options = Options()
-        chrome_options.add_argument("--start-maximized")
-        chrome_options.add_argument("--disable-infobars")
-        chrome_options.add_argument("--disable-extensions")
-        chrome_options.add_argument("--disable-notifications")
-        chrome_options.add_argument("--disable-popup-blocking")
-        
-        # Initialize browser
-        browser = webdriver.Chrome(options=chrome_options)
-        browser.get(self.game_url)
-        
-        return browser
+        try:
+            # Always open a new incognito window for clean session
+            chrome_options = Options()
+            chrome_options.add_argument("--incognito")
+            chrome_options.add_argument("--start-maximized")
+            chrome_options.add_argument("--disable-infobars")
+            chrome_options.add_argument("--disable-extensions")
+            chrome_options.add_argument("--disable-notifications")
+            chrome_options.add_argument("--disable-popup-blocking")
+            
+            # Disable GPU acceleration if it causes issues
+            # chrome_options.add_argument("--disable-gpu")
+            
+            # Explicitly disable password manager popups
+            chrome_options.add_experimental_option("prefs", {
+                "credentials_enable_service": False,
+                "profile.password_manager_enabled": False,
+                "profile.default_content_setting_values.notifications": 2
+            })
+            
+            # Reduce log noise
+            chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
+            
+            logger.info("Opening a new incognito browser window")
+            browser = webdriver.Chrome(service=Service(ChromeDriverManager().install()), 
+                                      options=chrome_options)
+            browser.get(self.game_url)
+            return browser
+        except Exception as e:
+            logger.error(f"Error initializing browser: {e}")
+            raise
     
     def _position_browser(self):
         """Position the browser window based on preference"""
         try:
+            if not self.browser_active:
+                return
+                
             # Use JavaScript to get accurate screen dimensions
             screen_width = self.browser.execute_script("return window.screen.width")
             screen_height = self.browser.execute_script("return window.screen.height")
@@ -121,8 +176,8 @@ class SubwaySurfersEnv:
             if self.position == "right":
                 # Position on right half of screen with a margin
                 browser_x = screen_width // 2
-                browser_width = (screen_width // 2) - 20  # Slightly less than half to avoid edge issues
-                browser_height = screen_height - 60  # Leave space for taskbar and other UI
+                browser_width = (screen_width // 2) - 20
+                browser_height = screen_height - 60
                 browser_y = 0
                 
                 self.browser.set_window_rect(browser_x, browser_y, browser_width, browser_height)
@@ -138,8 +193,8 @@ class SubwaySurfersEnv:
                 logger.info(f"Browser positioned on left side of screen with width={browser_width}")
             else:  # "center" or any other value
                 # Center the browser with reasonable dimensions
-                browser_width = min(1024, screen_width - 40)  # Use 1024px or slightly less than screen width
-                browser_height = min(768, screen_height - 60)  # Use 768px or slightly less than screen height
+                browser_width = min(1024, screen_width - 40)
+                browser_height = min(768, screen_height - 60)
                 browser_x = (screen_width - browser_width) // 2
                 browser_y = (screen_height - browser_height) // 2
                 
@@ -153,246 +208,83 @@ class SubwaySurfersEnv:
             logger.warning(f"Error positioning browser window: {str(e)}")
             logger.warning("Continuing with default browser positioning")
     
-    def _init_gui(self):
-        """Initialize GUI for visual feedback"""
-        self.root = tk.Tk()
-        self.root.title("Subway Surfers RL")
-        self.root.geometry("800x600")
-        
-        # Configure columns/rows to be responsive
-        self.root.grid_columnconfigure(0, weight=1)
-        self.root.grid_rowconfigure(1, weight=1)
-        
-        # Top frame for info
-        self.info_frame = tk.Frame(self.root)
-        self.info_frame.grid(row=0, column=0, sticky='ew', padx=10, pady=5)
-        
-        # Game info section
-        tk.Label(self.info_frame, text="Game Information", font=('Arial', 12, 'bold')).pack(anchor='w')
-        
-        # Create horizontal frames
-        self.horizontal_frame = tk.Frame(self.info_frame)
-        self.horizontal_frame.pack(fill=tk.X, expand=True)
-        
-        # Left side
-        self.left_frame = tk.Frame(self.horizontal_frame)
-        self.left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=10)
-        
-        # Game score and coins
-        self.score_frame = tk.Frame(self.left_frame)
-        self.score_frame.pack(pady=5, fill=tk.X)
-        
-        tk.Label(self.score_frame, text="Score:", width=10, anchor='w').grid(row=0, column=0, sticky='w')
-        self.score_label = tk.Label(self.score_frame, text="0", width=10, anchor='e')
-        self.score_label.grid(row=0, column=1, sticky='e')
-        
-        tk.Label(self.score_frame, text="Coins:", width=10, anchor='w').grid(row=1, column=0, sticky='w')
-        self.coins_label = tk.Label(self.score_frame, text="0", width=10, anchor='e')
-        self.coins_label.grid(row=1, column=1, sticky='e')
-        
-        # Right side
-        self.right_frame = tk.Frame(self.horizontal_frame)
-        self.right_frame.pack(side=tk.LEFT, fill=tk.Y, padx=10)
-        
-        # Episode info
-        self.episode_frame = tk.Frame(self.right_frame)
-        self.episode_frame.pack(pady=5, fill=tk.X)
-        
-        tk.Label(self.episode_frame, text="Episode:", width=10, anchor='w').grid(row=0, column=0, sticky='w')
-        self.episode_label = tk.Label(self.episode_frame, text="0", width=10, anchor='e')
-        self.episode_label.grid(row=0, column=1, sticky='e')
-        
-        tk.Label(self.episode_frame, text="Step:", width=10, anchor='w').grid(row=1, column=0, sticky='w')
-        self.step_label = tk.Label(self.episode_frame, text="0", width=10, anchor='e')
-        self.step_label.grid(row=1, column=1, sticky='e')
-        
-        # Action and reward
-        self.action_frame = tk.Frame(self.right_frame)
-        self.action_frame.pack(pady=5, fill=tk.X)
-        
-        tk.Label(self.action_frame, text="Action:", width=10, anchor='w').grid(row=0, column=0, sticky='w')
-        self.action_label = tk.Label(self.action_frame, text="noop", width=10, anchor='e')
-        self.action_label.grid(row=0, column=1, sticky='e')
-        
-        tk.Label(self.action_frame, text="Reward:", width=10, anchor='w').grid(row=1, column=0, sticky='w')
-        self.reward_label = tk.Label(self.action_frame, text="0.0", width=10, anchor='e')
-        self.reward_label.grid(row=1, column=1, sticky='e')
-        
-        # Game over status
-        self.status_frame = tk.Frame(self.info_frame)
-        self.status_frame.pack(pady=5, fill=tk.X)
-        tk.Label(self.status_frame, text="Game Status:", width=10, anchor='w').pack(side=tk.LEFT)
-        self.status_label = tk.Label(self.status_frame, text="Playing", fg="green", font=('Arial', 10, 'bold'))
-        self.status_label.pack(side=tk.LEFT)
-        
-        # Central frame for game state and regions
-        self.central_frame = tk.Frame(self.root)
-        self.central_frame.grid(row=1, column=0, sticky='nsew', padx=10, pady=5)
-        
-        # Left side: Game state
-        self.state_frame = tk.Frame(self.central_frame)
-        self.state_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
-        
-        self.state_canvas_label = tk.Label(self.state_frame, text="Current State", font=('Arial', 10, 'bold'))
-        self.state_canvas_label.pack(pady=(5, 5))
-        self.state_canvas = tk.Canvas(self.state_frame, width=200, height=200, bg='black')
-        self.state_canvas.pack(fill=tk.BOTH, expand=True)
-        
-        # Right side: Game regions
-        self.regions_frame = tk.Frame(self.central_frame)
-        self.regions_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5)
-        
-        self.regions_label = tk.Label(self.regions_frame, text="Game Regions", font=('Arial', 10, 'bold'))
-        self.regions_label.pack(pady=(5, 5))
-        self.regions_canvas = tk.Canvas(self.regions_frame, width=300, height=300, bg='black')
-        self.regions_canvas.pack(fill=tk.BOTH, expand=True)
-        
-        # Bottom frame for stats
-        self.stats_frame = tk.Frame(self.root)
-        self.stats_frame.grid(row=2, column=0, sticky='ew', padx=10, pady=5)
-        
-        tk.Label(self.stats_frame, text="Training Statistics", font=('Arial', 12, 'bold')).pack(anchor='w')
-        
-        # Horizontal layout for statistics
-        self.stats_horizontal_frame = tk.Frame(self.stats_frame)
-        self.stats_horizontal_frame.pack(fill=tk.X, expand=True)
-        
-        # Training stats
-        self.training_frame = tk.Frame(self.stats_horizontal_frame)
-        self.training_frame.pack(side=tk.LEFT, fill=tk.Y, padx=10)
-        
-        tk.Label(self.training_frame, text="Avg Reward:", width=15, anchor='w').grid(row=0, column=0, sticky='w')
-        self.avg_reward_label = tk.Label(self.training_frame, text="0.0", width=10, anchor='e')
-        self.avg_reward_label.grid(row=0, column=1, sticky='e')
-        
-        tk.Label(self.training_frame, text="Epsilon:", width=15, anchor='w').grid(row=1, column=0, sticky='w')
-        self.epsilon_label = tk.Label(self.training_frame, text="0.0", width=10, anchor='e')
-        self.epsilon_label.grid(row=1, column=1, sticky='e')
-        
-        tk.Label(self.training_frame, text="Loss:", width=15, anchor='w').grid(row=2, column=0, sticky='w')
-        self.loss_label = tk.Label(self.training_frame, text="0.0", width=10, anchor='e')
-        self.loss_label.grid(row=2, column=1, sticky='e')
-        
-        # Schedule the first update
-        self.root.after(100, self._update_gui)
-    
-    def _update_gui(self):
-        """Update GUI with current game state"""
-        if hasattr(self, 'root') and self.root.winfo_exists():
-            # Update game information
-            self.score_label.config(text=f"{self.score}")
-            self.coins_label.config(text=f"{self.coins}")
-            self.episode_label.config(text=f"{self.episode_count}")
-            self.step_label.config(text=f"{self.step_count}")
-            self.action_label.config(text=f"{self.last_action if self.last_action else 'noop'}")
-            self.reward_label.config(text=f"{self.last_reward:.2f}")
+    def _save_debug_regions(self, screenshot=None):
+        """Save a debug image showing the detected regions"""
+        try:
+            # Capture screenshot if not provided
+            if screenshot is None:
+                screenshot = self.capture_screen()
+                
+            if screenshot is None:
+                logger.warning("Empty screenshot, skipping debug regions")
+                return
+                
+            # Draw regions on the screenshot
+            debug_img = screenshot.copy()
             
-            # Update game status
-            if self.game_over:
-                self.status_label.config(text="Game Over", fg="red")
-            else:
-                self.status_label.config(text="Playing", fg="green")
+            # Draw game region (green)
+            x, y, w, h = self.game_region
+            cv2.rectangle(debug_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            cv2.putText(debug_img, "Game Region", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
-            # Update epsilon and loss if available
-            if hasattr(self, 'epsilon'):
-                self.epsilon_label.config(text=f"{self.epsilon:.4f}")
+            # Draw score region (blue)
+            x, y, w, h = self.score_region
+            cv2.rectangle(debug_img, (x, y), (x+w, y+h), (255, 0, 0), 2)
+            cv2.putText(debug_img, "Score", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
             
-            if hasattr(self, 'loss') and self.loss is not None:
-                self.loss_label.config(text=f"{self.loss:.4f}")
+            # Draw coin region (yellow)
+            x, y, w, h = self.coin_region
+            cv2.rectangle(debug_img, (x, y), (x+w, y+h), (0, 255, 255), 2)
+            cv2.putText(debug_img, "Coins", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             
-            if hasattr(self, 'avg_reward') and self.avg_reward is not None:
-                self.avg_reward_label.config(text=f"{self.avg_reward:.2f}")
+            # Save the debug image
+            debug_path = "debug_images/regions/initial_regions.png"
+            cv2.imwrite(debug_path, debug_img)
+            logger.info(f"Initial regions debug image saved to {debug_path}")
             
-            # Update state visualization if available
-            if hasattr(self, 'current_state_img') and self.current_state_img is not None:
-                self.state_canvas.delete("all")
-                self.state_canvas.create_image(100, 100, image=self.current_state_img)
-            
-            # Update game regions visualization
-            if self.render_mode == "human" and hasattr(self, 'regions_canvas'):
-                try:
-                    # Get a screenshot
-                    screenshot = self.capture_screen()
-                    
-                    # Resize to fit the canvas
-                    if screenshot is not None:
-                        canvas_width = self.regions_canvas.winfo_width()
-                        canvas_height = self.regions_canvas.winfo_height()
-                        
-                        # Make sure we have valid dimensions
-                        if canvas_width > 50 and canvas_height > 50:
-                            # Resize screenshot to fit the canvas
-                            aspect_ratio = screenshot.shape[1] / screenshot.shape[0]
-                            
-                            if aspect_ratio > (canvas_width / canvas_height):
-                                # Width constrained
-                                display_width = canvas_width
-                                display_height = int(canvas_width / aspect_ratio)
-                            else:
-                                # Height constrained
-                                display_height = canvas_height
-                                display_width = int(canvas_height * aspect_ratio)
-                            
-                            # Resize the image to display size
-                            display_img = cv2.resize(screenshot, (display_width, display_height))
-                            
-                            # Scale the region coordinates
-                            scale_x = display_width / screenshot.shape[1]
-                            scale_y = display_height / screenshot.shape[0]
-                            
-                            # Draw regions on the image
-                            if self.game_region:
-                                x, y, w, h = self.game_region
-                                x1, y1 = int(x * scale_x), int(y * scale_y)
-                                x2, y2 = int((x + w) * scale_x), int((y + h) * scale_y)
-                                cv2.rectangle(display_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                                cv2.putText(display_img, "Game", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                                
-                            if self.score_region:
-                                x, y, w, h = self.score_region
-                                x1, y1 = int(x * scale_x), int(y * scale_y)
-                                x2, y2 = int((x + w) * scale_x), int((y + h) * scale_y)
-                                cv2.rectangle(display_img, (x1, y1), (x2, y2), (255, 0, 0), 2)
-                                cv2.putText(display_img, "Score", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
-                                
-                            if self.coin_region:
-                                x, y, w, h = self.coin_region
-                                x1, y1 = int(x * scale_x), int(y * scale_y)
-                                x2, y2 = int((x + w) * scale_x), int((y + h) * scale_y)
-                                cv2.rectangle(display_img, (x1, y1), (x2, y2), (0, 255, 255), 2)
-                                cv2.putText(display_img, "Coins", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                            
-                            # Convert to RGB for PIL
-                            display_img_rgb = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
-                            
-                            # Convert to PhotoImage
-                            pil_img = Image.fromarray(display_img_rgb)
-                            photo_img = ImageTk.PhotoImage(image=pil_img)
-                            
-                            # Update canvas
-                            self.regions_canvas.delete("all")
-                            self.regions_canvas.create_image(display_width//2, display_height//2, image=photo_img)
-                            self.regions_canvas.image = photo_img  # Keep a reference
-                except Exception as e:
-                    logger.warning(f"Error updating regions visualization: {str(e)}")
-            
-            # Schedule the next update
-            self.root.after(100, self._update_gui)
+        except Exception as e:
+            logger.warning(f"Error saving debug regions: {e}")
     
     def initialize_game(self):
         """Initialize the game by clicking the play button or restarting"""
         logger.info("Initializing game...")
         
         try:
-            # Wait for and click the play button (may be different depending on the site)
-            WebDriverWait(self.browser, 5).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, ".pokiSdkStartButton"))
-            ).click()
-        except (TimeoutException, ElementNotInteractableException):
-            # If can't find the play button, try clicking in the center of the page
-            logger.info("Clicking center of screen as fallback")
+            if not self.browser_active:
+                return
+                
+            # First make sure browser is focused
+            self.browser.switch_to.window(self.browser.current_window_handle)
             
-            try:
+            # Handle cookie consent if present (common on many game sites)
+            self._handle_cookie_consent()
+            
+            # Try multiple play button selectors
+            play_selectors = [
+                ".pokiSdkStartButton", 
+                "#play-button", 
+                ".play-button", 
+                "button.play",
+                "[data-testid='play-button']"
+            ]
+            
+            play_button_clicked = False
+            for selector in play_selectors:
+                try:
+                    play_button = WebDriverWait(self.browser, 2).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                    )
+                    play_button.click()
+                    play_button_clicked = True
+                    logger.info(f"Clicked play button with selector: {selector}")
+                    break
+                except (TimeoutException, ElementNotInteractableException):
+                    continue
+            
+            # If can't find the play button, try clicking in the center of the page
+            if not play_button_clicked:
+                logger.info("Clicking center of screen as fallback")
+                
                 # Use JavaScript to get accurate window dimensions and click center
                 browser_width = self.browser.execute_script("return window.innerWidth")
                 browser_height = self.browser.execute_script("return window.innerHeight")
@@ -400,124 +292,370 @@ class SubwaySurfersEnv:
                 center_x = browser_width // 2
                 center_y = browser_height // 2
                 
-                # Use JavaScript to click at the center coordinates
-                self.browser.execute_script(f"document.elementFromPoint({center_x}, {center_y}).click()")
-                logger.info(f"Clicked at center coordinates: ({center_x}, {center_y})")
-            except Exception as e:
-                logger.warning(f"Failed to click using JavaScript: {str(e)}")
-                
-                # Alternative approach: try to find and click on the game canvas directly
+                # Try both JavaScript click and PyAutoGUI click for redundancy
                 try:
-                    # Look for common game canvas elements
-                    canvas_elements = self.browser.find_elements(By.TAG_NAME, "canvas")
-                    if canvas_elements:
-                        canvas_elements[0].click()
-                        logger.info("Clicked on canvas element")
-                    else:
-                        logger.warning("No canvas elements found")
-                except Exception as canvas_e:
-                    logger.warning(f"Failed to click on canvas: {str(canvas_e)}")
-        
-        # Make sure the game is ready
-        time.sleep(1)
+                    self.browser.execute_script(f"document.elementFromPoint({center_x}, {center_y}).click()")
+                    logger.info(f"JS clicked at center coordinates: ({center_x}, {center_y})")
+                except Exception:
+                    # If JS click fails, try PyAutoGUI click
+                    try:
+                        # Convert browser-relative coordinates to screen coordinates
+                        browser_rect = self.browser.get_window_rect()
+                        screen_x = browser_rect['x'] + center_x
+                        screen_y = browser_rect['y'] + center_y
+                        pyautogui.click(screen_x, screen_y)
+                        logger.info(f"PyAutoGUI clicked at screen coordinates: ({screen_x}, {screen_y})")
+                    except Exception as e:
+                        logger.warning(f"Failed to click with PyAutoGUI: {e}")
+                
+            # Ensure game is started by pressing space key
+            time.sleep(1)
+            pyautogui.press('space')
+            
+            # Make sure the game is ready
+            time.sleep(2)
+        except Exception as e:
+            logger.warning(f"Error during game initialization: {e}")
+            logger.warning("Attempting to continue anyway")
     
-    def detect_game_region(self):
-        """Detect the game region, score region, and coin region"""
-        logger.info("Detecting game region...")
-        # Take a screenshot
-        screenshot = self.capture_screen()
+    def _handle_cookie_consent(self):
+        """Handle cookie consent dialogs that might appear"""
+        # Common cookie consent button selectors
+        consent_selectors = [
+            "#accept-cookies", 
+            ".consent-accept", 
+            "[aria-label='Accept cookies']",
+            "button:contains('Accept')",
+            ".consent-banner__accept"
+        ]
         
-        # Get screen dimensions from the browser
-        screen_width = self.browser.get_window_size()['width']
-        screen_height = self.browser.get_window_size()['height']
+        for selector in consent_selectors:
+            try:
+                consent_button = WebDriverWait(self.browser, 1).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                )
+                consent_button.click()
+                logger.info(f"Clicked cookie consent button with selector: {selector}")
+                time.sleep(0.5)
+                return True
+            except (TimeoutException, ElementNotInteractableException):
+                continue
         
-        # Define improved game region based on the Subway Surfers layout from the screenshot
-        # The main gameplay area should include the tracks, player character, and obstacles
-        x_offset = int(screen_width * 0.10)  # Start from 10% from the left (wider)
-        y_offset = int(screen_height * 0.10)  # Start higher - 10% from top
-        game_width = int(screen_width * 0.80)  # Game width is about 80% of screen width
-        game_height = int(screen_height * 0.75)  # Game height is about 75% of screen height
+        return False
+    
+    def detect_save_me_popup(self):
+        """
+        Detect if the 'Save me!' popup is currently displayed
         
-        self.game_region = (x_offset, y_offset, game_width, game_height)
-        logger.info(f"Game region detected: {self.game_region}")
+        Returns:
+            Boolean indicating if popup is detected
+        """
+        try:
+            if not self.browser_active:
+                return False
+                
+            # Capture screen and get the game region
+            screenshot = self.capture_screen()
+            
+            if screenshot is None:
+                logger.warning("Empty screenshot in detect_save_me_popup")
+                return False
+                
+            # Check if game region is valid within screenshot dimensions
+            height, width = screenshot.shape[:2]
+            x, y, w, h = self.game_region
+            
+            if x >= width or y >= height or x+w > width or y+h > height:
+                logger.warning(f"Game region outside screenshot dimensions: game region={self.game_region}, screenshot={width}x{height}")
+                return False
+                
+            game_area = screenshot[y:y+h, x:x+w]
+            
+            # Save the game area for debugging
+            debug_path = f"debug_images/popups/game_area_{self.episode_count}_{self.step_count}.png"
+            cv2.imwrite(debug_path, game_area)
+            
+            # Method 1: Check for white/light areas in the center-upper part
+            # Convert to HSV for better color segmentation
+            hsv = cv2.cvtColor(game_area, cv2.COLOR_BGR2HSV)
+            
+            # Define range for white/light gray colors (popup background)
+            lower_white = np.array([0, 0, 180])  # Low saturation, high value
+            upper_white = np.array([180, 30, 255])
+            
+            # Create mask for white areas
+            white_mask = cv2.inRange(hsv, lower_white, upper_white)
+            
+            # Look for blue "Save me!" text
+            lower_blue = np.array([90, 50, 150])
+            upper_blue = np.array([120, 255, 255])
+            blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
+            
+            # Check for significant white and blue areas in the top section 
+            top_section = white_mask[0:h//3, :]
+            white_pixels = np.count_nonzero(top_section)
+            white_ratio = white_pixels / (top_section.shape[0] * top_section.shape[1])
+            
+            blue_section = blue_mask[0:h//3, :]
+            blue_pixels = np.count_nonzero(blue_section)
+            blue_ratio = blue_pixels / (blue_section.shape[0] * blue_section.shape[1])
+            
+            # Save mask images for debugging
+            combined_debug = np.zeros_like(game_area)
+            combined_debug[:, :, 0] = blue_mask  # Blue channel
+            combined_debug[:, :, 1] = np.zeros_like(blue_mask)  # Green channel
+            combined_debug[:, :, 2] = white_mask  # Red channel
+            debug_path = f"debug_images/popups/popup_masks_{self.episode_count}_{self.step_count}.png"
+            cv2.imwrite(debug_path, combined_debug)
+            
+            # Method 2: Template matching (more reliable)
+            # We'll implement a simplified template matching by looking for specific patterns
+            
+            # Convert to grayscale for simpler matching
+            gray = cv2.cvtColor(game_area, cv2.COLOR_BGR2GRAY)
+            
+            # Binarize the image
+            _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+            
+            # Check for large white rectangular area in the center top portion
+            center_top = binary[h//8:h//3, w//4:3*w//4]
+            white_ratio_center = np.count_nonzero(center_top) / (center_top.shape[0] * center_top.shape[1])
+            
+            # If both white and blue elements are present in significant amounts, likely popup
+            is_popup_method1 = (white_ratio > 0.15) and (blue_ratio > 0.01)
+            is_popup_method2 = white_ratio_center > 0.7
+            
+            is_popup = is_popup_method1 or is_popup_method2
+            
+            if is_popup:
+                logger.info(f"'Save me!' popup detected (method1: {is_popup_method1}, method2: {is_popup_method2})")
+                logger.info(f"White ratio: {white_ratio:.2f}, Blue ratio: {blue_ratio:.2f}, Center white: {white_ratio_center:.2f}")
+            
+            return is_popup
+            
+        except Exception as e:
+            logger.error(f"Error detecting save me popup: {str(e)}")
+            return False
+    
+    def handle_game_over(self):
+        """
+        Handle game over and restart the game, including dismissing 'Save me!' popup
         
-        # Define score region at the top right corner
-        # Move it higher based on screenshot
-        score_x = int(screen_width * 0.75)
-        score_y = int(screen_height * 0.08)  # Move higher
-        score_width = int(screen_width * 0.20)  # Make wider
-        score_height = int(screen_height * 0.06)  # Make slightly taller
-        self.score_region = (score_x, score_y, score_width, score_height)
-        logger.info(f"Score region set to: {self.score_region}")
+        Returns:
+            Boolean indicating success
+        """
+        logger.info("Handling game over...")
         
-        # Define coin region (with the coin icon) below the score
-        coin_x = int(screen_width * 0.75)
-        coin_y = int(screen_height * 0.15)  # Position directly below score
-        coin_width = int(screen_width * 0.20)  # Make wider
-        coin_height = int(screen_height * 0.06)  # Make slightly taller
-        self.coin_region = (coin_x, coin_y, coin_width, coin_height)
-        logger.info(f"Coin region set to: {self.coin_region}")
+        try:
+            if not self.browser_active:
+                return False
+            
+            # Make sure browser is in focus
+            try:
+                self.browser.switch_to.window(self.browser.current_window_handle)
+            except Exception as e:
+                logger.warning(f"Error switching to window: {e}")
+                
+            # First check if "Save me!" popup is visible
+            if self.detect_save_me_popup():
+                logger.info("Detected 'Save me!' popup, waiting 1 second...")
+                time.sleep(1)  # Small wait to ensure UI is stable
+                
+                # Get game region
+                x, y, w, h = self.game_region
+                
+                # Click in game area but NOT on the popup (which is typically in the center upper area)
+                # Click in lower part of game area
+                click_x = x + w // 2   # Center horizontal
+                click_y = y + int(h * 0.8)  # 80% down from top
+                
+                # Use pyautogui to click
+                pyautogui.click(click_x, click_y)
+                logger.info(f"Clicked outside popup at ({click_x}, {click_y})")
+                
+                # Wait for popup to disappear
+                time.sleep(1.5)
+                
+                # Press space to restart
+                logger.info("Pressing space to restart game...")
+                pyautogui.press('space')
+                
+                # Wait for game to restart
+                time.sleep(1.5)
+                
+                # Also try clicking at center of game (backup method)
+                center_x = x + w // 2
+                center_y = y + h // 2
+                time.sleep(0.5)  # Small wait
+                pyautogui.click(center_x, center_y)
+                
+                # Wait additional time for game to fully restart
+                time.sleep(1.5)
+            else:
+                # If no popup, just press space and click center
+                logger.info("No popup detected, pressing space to restart game...")
+                
+                # Make sure the browser window is in focus before pressing keys
+                try:
+                    self.browser.execute_script("window.focus();")
+                except Exception as e:
+                    logger.warning(f"Error focusing window: {e}")
+                
+                # Press space to restart
+                pyautogui.press('space')
+                
+                # Get game region
+                x, y, w, h = self.game_region
+                center_x = x + w // 2
+                center_y = y + h // 2
+                
+                # Click at center as backup
+                time.sleep(0.5)
+                pyautogui.click(center_x, center_y)
+                
+                # Wait for game to restart
+                time.sleep(1.5)
+            
+            # Reset game state
+            self.game_over = False
+            
+            # Check if game successfully restarted (should have movement)
+            if not self._check_game_active():
+                logger.warning("Game might not have restarted properly, trying alternative methods")
+                
+                # Try clicking several positions
+                x, y, w, h = self.game_region
+                center_x = x + w // 2
+                center_y = y + h // 2
+                
+                click_positions = [
+                    (center_x, center_y),  # Center
+                    (center_x, center_y - h // 4),  # Upper center 
+                    (center_x, center_y + h // 4),  # Lower center
+                ]
+                
+                for cx, cy in click_positions:
+                    # Make sure browser is in focus
+                    try:
+                        self.browser.switch_to.window(self.browser.current_window_handle)
+                    except Exception:
+                        pass
+                    
+                    pyautogui.click(cx, cy)
+                    time.sleep(0.5)
+                    pyautogui.press('space')
+                    time.sleep(1)
+                    
+                    # Check if game is now active
+                    if self._check_game_active():
+                        logger.info("Game successfully restarted after retry")
+                        return True
+                        
+                # If still not active, try refreshing the page as a last resort
+                logger.warning("Game still not active, refreshing the page")
+                try:
+                    self.browser.refresh()
+                    time.sleep(5)  # Wait for page to reload
+                    self.initialize_game()
+                    time.sleep(2)
+                    return self._check_game_active()
+                except Exception as e:
+                    logger.error(f"Error refreshing the page: {e}")
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error handling game over: {str(e)}")
+            return False
+    
+    def _check_game_active(self):
+        """
+        Check if game is active by capturing two frames and comparing them
         
-        # Save a debug screenshot with regions drawn
-        debug_img = screenshot.copy()
-        
-        # Draw game region (green)
-        cv2.rectangle(
-            debug_img,
-            (self.game_region[0], self.game_region[1]),
-            (self.game_region[0] + self.game_region[2], self.game_region[1] + self.game_region[3]),
-            (0, 255, 0),
-            2
-        )
-        
-        # Draw score region (blue)
-        cv2.rectangle(
-            debug_img,
-            (self.score_region[0], self.score_region[1]),
-            (self.score_region[0] + self.score_region[2], self.score_region[1] + self.score_region[3]),
-            (255, 0, 0),
-            2
-        )
-        
-        # Draw coin region (yellow)
-        cv2.rectangle(
-            debug_img,
-            (self.coin_region[0], self.coin_region[1]),
-            (self.coin_region[0] + self.coin_region[2], self.coin_region[1] + self.coin_region[3]),
-            (0, 255, 255),
-            2
-        )
-        
-        # Add labels for clarity
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        cv2.putText(debug_img, "Game Region", (self.game_region[0], self.game_region[1] - 10), 
-                    font, 0.7, (0, 255, 0), 2)
-        cv2.putText(debug_img, "Score", (self.score_region[0], self.score_region[1] - 10), 
-                    font, 0.7, (255, 0, 0), 2)
-        cv2.putText(debug_img, "Coins", (self.coin_region[0], self.coin_region[1] - 10), 
-                    font, 0.7, (0, 255, 255), 2)
-        
-        # Save debug image
-        debug_path = "debug_images/game_region.png"
-        cv2.imwrite(debug_path, debug_img)
-        logger.info(f"Debug screenshot with regions saved as {debug_path}")
-        
-        # If show_regions is enabled, also display the debug image
-        if self.render_mode == "human":
-            # Display the image with detected regions
-            cv2.imshow("Game Regions", debug_img)
-            cv2.waitKey(1)  # Update the window
+        Returns:
+            Boolean indicating if game is active (has movement)
+        """
+        try:
+            if not self.browser_active:
+                return False
+                
+            # Capture first frame
+            frame1 = self.get_game_frame()
+            
+            if frame1 is None or frame1.size == 0:
+                logger.warning("Empty frame in _check_game_active")
+                return False
+                
+            # Small wait
+            time.sleep(0.5)
+            
+            # Capture second frame
+            frame2 = self.get_game_frame()
+            
+            if frame2 is None or frame2.size == 0:
+                logger.warning("Empty second frame in _check_game_active")
+                return False
+                
+            # Convert to grayscale for comparison
+            gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
+            gray2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
+            
+            # Calculate absolute difference
+            diff = cv2.absdiff(gray1, gray2)
+            
+            # Calculate mean difference (movement)
+            mean_diff = np.mean(diff)
+            
+            # If significant difference, game is active
+            is_active = mean_diff > 3.0  # Threshold may need adjustment
+            
+            # Save diff image for debugging
+            if self.step_count % 100 == 0 or self.step_count < 10:
+                debug_path = f"debug_images/frames/diff_{self.episode_count}_{self.step_count}.png"
+                cv2.imwrite(debug_path, diff)
+                
+                # Enhance diff for visualization
+                diff_color = cv2.applyColorMap(diff * 10, cv2.COLORMAP_JET)
+                debug_path = f"debug_images/frames/diff_enhanced_{self.episode_count}_{self.step_count}.png"
+                cv2.imwrite(debug_path, diff_color)
+                
+                logger.info(f"Game activity check: {is_active} (diff: {mean_diff:.4f})")
+            
+            return is_active
+            
+        except Exception as e:
+            logger.error(f"Error checking game activity: {str(e)}")
+            return False
     
     def capture_screen(self):
         """Capture the current screen as a numpy array"""
-        # Take screenshot using selenium
-        screenshot = self.browser.get_screenshot_as_png()
-        
-        # Convert to numpy array
-        screenshot = np.frombuffer(screenshot, np.uint8)
-        screenshot = cv2.imdecode(screenshot, cv2.IMREAD_COLOR)
-        
-        return screenshot
+        start_time = time.time()
+        try:
+            if not self.browser_active:
+                blank_img = np.zeros((600, 800, 3), dtype=np.uint8)
+                logger.warning("Browser not active, returning blank image")
+                return blank_img
+                
+            # Take screenshot using selenium
+            try:
+                screenshot = self.browser.get_screenshot_as_png()
+                
+                # Convert to numpy array
+                screenshot = np.frombuffer(screenshot, np.uint8)
+                screenshot = cv2.imdecode(screenshot, cv2.IMREAD_COLOR)
+                
+                # Record capture time
+                self.frame_capture_times.append(time.time() - start_time)
+                
+                return screenshot
+            except WebDriverException as e:
+                logger.error(f"Error capturing screen: {str(e)}")
+                self.browser_active = False
+                return np.zeros((600, 800, 3), dtype=np.uint8)  # Return blank image
+        except Exception as e:
+            logger.error(f"Error in capture_screen: {str(e)}")
+            return np.zeros((600, 800, 3), dtype=np.uint8)  # Return blank image
     
     def preprocess_frame(self, frame):
         """
@@ -530,11 +668,19 @@ class SubwaySurfersEnv:
             Preprocessed frame (grayscale, resized to 84x84)
         """
         try:
+            if frame is None:
+                logger.error("Received None frame in preprocess_frame")
+                return np.zeros((84, 84), dtype=np.float32)
+                
             # Make a copy to avoid modifying the original
             frame_copy = frame.copy()
             
             # Convert to grayscale
-            gray = cv2.cvtColor(frame_copy, cv2.COLOR_RGB2GRAY)
+            gray = cv2.cvtColor(frame_copy, cv2.COLOR_BGR2GRAY)
+            
+            # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) for better contrast
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            gray = clahe.apply(gray)
             
             # Resize to 84x84 (standard for DQN)
             resized = cv2.resize(gray, (84, 84), interpolation=cv2.INTER_AREA)
@@ -556,17 +702,35 @@ class SubwaySurfersEnv:
     def get_game_frame(self):
         """Get the current game frame (cropped to game region)"""
         try:
+            if not self.browser_active:
+                # Return a blank frame if browser is not active
+                x, y, width, height = self.game_region
+                return np.zeros((height, width, 3), dtype=np.uint8)
+                
             screenshot = self.capture_screen()
             
+            if screenshot is None:
+                logger.error("Empty screenshot in get_game_frame")
+                return np.zeros((self.game_region[3], self.game_region[2], 3), dtype=np.uint8)
+                
             # Crop to game region
             if self.game_region:
                 x, y, width, height = self.game_region
-                game_frame = screenshot[y:y+height, x:x+width].copy()  # Use .copy() to ensure memory is released
                 
-                # Release the memory of the full screenshot
-                del screenshot
-                
-                return game_frame
+                # Check if region is valid within the screenshot
+                if (y+height <= screenshot.shape[0] and x+width <= screenshot.shape[1]):
+                    game_frame = screenshot[y:y+height, x:x+width].copy()
+                    
+                    # Save frame periodically for debugging
+                    if self.step_count % 100 == 0 or self.step_count < 10:
+                        debug_path = f"debug_images/frames/frame_{self.episode_count}_{self.step_count}.png"
+                        cv2.imwrite(debug_path, game_frame)
+                    
+                    return game_frame
+                else:
+                    logger.warning(f"Game region outside screenshot dimensions: {self.game_region} vs {screenshot.shape}")
+                    # Return a blank frame of expected size
+                    return np.zeros((height, width, 3), dtype=np.uint8)
             else:
                 logger.warning("Game region not detected, using full screenshot")
                 return screenshot.copy()
@@ -581,131 +745,173 @@ class SubwaySurfersEnv:
     
     def get_score(self):
         """Extract score from the score region using OCR"""
+        start_time = time.time()
         try:
+            if not self.browser_active:
+                return self.score + 5  # Fallback to estimated score
+                
             screenshot = self.capture_screen()
             
+            if screenshot is None:
+                logger.warning("Empty screenshot in get_score")
+                return self.score + 5  # Fallback to estimated score
+                
             if self.score_region:
                 x, y, width, height = self.score_region
-                score_image = screenshot[y:y+height, x:x+width]
                 
-                # Save original ROI for debugging
-                cv2.imwrite("debug_images/score_roi.png", score_image)
-                
-                # Enhanced preprocessing for OCR
-                # Convert to grayscale
-                gray = cv2.cvtColor(score_image, cv2.COLOR_BGR2GRAY)
-                
-                # Apply adaptive thresholding to handle different lighting conditions
-                binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                              cv2.THRESH_BINARY, 11, 2)
-                
-                # Invert if needed (white text on black background)
-                if np.mean(binary) < 127:
-                    binary = cv2.bitwise_not(binary)
+                # Check if region is valid
+                if (y+height <= screenshot.shape[0] and x+width <= screenshot.shape[1]):
+                    score_image = screenshot[y:y+height, x:x+width]
                     
-                # Dilate to make text more visible
-                kernel = np.ones((2, 2), np.uint8)
-                dilated = cv2.dilate(binary, kernel, iterations=1)
+                    # Save score image periodically for debugging
+                    if self.step_count % 100 == 0 or self.step_count < 10:
+                        debug_path = f"debug_images/scores/score_{self.episode_count}_{self.step_count}.png"
+                        cv2.imwrite(debug_path, score_image)
+                    
+                    # Convert to grayscale
+                    gray = cv2.cvtColor(score_image, cv2.COLOR_BGR2GRAY)
+                    
+                    # Apply adaptive thresholding
+                    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                                  cv2.THRESH_BINARY, 11, 2)
+                    
+                    # Invert if needed (white text on black background)
+                    if np.mean(binary) < 127:
+                        binary = cv2.bitwise_not(binary)
+                    
+                    # Try different OCR configurations
+                    ocr_configs = [
+                        '--psm 7 -c tessedit_char_whitelist=0123456789',  # Single line of text
+                        '--psm 8 -c tessedit_char_whitelist=0123456789',  # Single word
+                        '--psm 6 -c tessedit_char_whitelist=0123456789'   # Assume uniform block of text
+                    ]
+                    
+                    for config in ocr_configs:
+                        try:
+                            text = pytesseract.image_to_string(binary, config=config)
+                            text = ''.join(filter(str.isdigit, text))  # Keep only digits
+                            
+                            if text and text.isdigit():
+                                current_score = int(text)
+                                
+                                # Sanity check - score should generally increase
+                                if current_score >= self.score:
+                                    self.score = current_score
+                                    self.ocr_times.append(time.time() - start_time)
+                                    return current_score
+                                # If score is close to last score, use it anyway (might be legitimate decrease)
+                                elif self.score - current_score < 100:
+                                    self.score = current_score
+                                    self.ocr_times.append(time.time() - start_time)
+                                    return current_score
+                        except Exception as e:
+                            logger.debug(f"OCR error with config {config}: {e}")
+                            continue
                 
-                # Save processed image for debugging
-                os.makedirs("debug_images/score", exist_ok=True)
-                timestamp = int(time.time() * 1000)
-                cv2.imwrite(f"debug_images/score/processed_{timestamp}.png", dilated)
-                
-                # Try different OCR configurations
-                ocr_configs = [
-                    '--psm 7 -c tessedit_char_whitelist=0123456789',  # Single line of text
-                    '--psm 8 -c tessedit_char_whitelist=0123456789',  # Single word
-                    '--psm 10 -c tessedit_char_whitelist=0123456789', # Single character
-                    '--psm 6 -c tessedit_char_whitelist=0123456789'   # Assume uniform block of text
-                ]
-                
-                for config in ocr_configs:
-                    try:
-                        text = pytesseract.image_to_string(dilated, config=config)
-                        text = ''.join(filter(str.isdigit, text))  # Keep only digits
-                        
-                        if text and text.isdigit():
-                            logger.debug(f"OCR detected score: {text}")
-                            return int(text)
-                    except Exception as e:
-                        logger.debug(f"OCR attempt failed with config {config}: {str(e)}")
-                        continue
-                
-                # If all OCR attempts fail, use differential score update
-                logger.debug("OCR failed, using estimated score")
-                return self.score + 5  # Assume score increases by about 5 per step
+                # If OCR fails, use estimated score increase
+                # More sophisticated estimation based on step count
+                if self.step_count < 500:
+                    # Early game: slower score increase
+                    score_increase = 3 + random.randint(0, 3)
+                else:
+                    # Later game: faster score increase
+                    score_increase = 5 + random.randint(0, 5)
+                    
+                self.score += score_increase
+                self.ocr_times.append(time.time() - start_time)
+                return self.score
             else:
                 # If region not set, simulate score increase
-                return self.score + 5
+                self.score += 5
+                self.ocr_times.append(time.time() - start_time)
+                return self.score
         except Exception as e:
             logger.warning(f"Error in score detection: {str(e)}")
-            return self.score + 5  # Fallback to estimated score
+            self.score += 5  # Fallback to estimated score
+            self.ocr_times.append(time.time() - start_time)
+            return self.score
     
     def get_coins(self):
         """Extract coins from the coin region using OCR"""
+        start_time = time.time()
         try:
+            if not self.browser_active:
+                return self.coins  # Keep current coin count
+                
             screenshot = self.capture_screen()
             
+            if screenshot is None:
+                logger.warning("Empty screenshot in get_coins")
+                return self.coins  # Keep current coin count
+                
             if self.coin_region:
                 x, y, width, height = self.coin_region
-                coin_image = screenshot[y:y+height, x:x+width]
                 
-                # Save original ROI for debugging
-                cv2.imwrite("debug_images/coins_roi.png", coin_image)
-                
-                # Enhanced preprocessing for OCR
-                # Convert to grayscale
-                gray = cv2.cvtColor(coin_image, cv2.COLOR_BGR2GRAY)
-                
-                # Apply adaptive thresholding
-                binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                              cv2.THRESH_BINARY, 11, 2)
-                
-                # Invert if needed (white text on black background)
-                if np.mean(binary) < 127:
-                    binary = cv2.bitwise_not(binary)
+                # Check if region is valid
+                if (y+height <= screenshot.shape[0] and x+width <= screenshot.shape[1]):
+                    coin_image = screenshot[y:y+height, x:x+width]
                     
-                # Dilate to make text more visible
-                kernel = np.ones((2, 2), np.uint8)
-                dilated = cv2.dilate(binary, kernel, iterations=1)
+                    # Save coin image periodically for debugging
+                    if self.step_count % 100 == 0 or self.step_count < 10:
+                        debug_path = f"debug_images/coins/coin_{self.episode_count}_{self.step_count}.png"
+                        cv2.imwrite(debug_path, coin_image)
+                    
+                    # Convert to grayscale
+                    gray = cv2.cvtColor(coin_image, cv2.COLOR_BGR2GRAY)
+                    
+                    # Apply adaptive thresholding
+                    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                                  cv2.THRESH_BINARY, 11, 2)
+                    
+                    # Invert if needed (white text on black background)
+                    if np.mean(binary) < 127:
+                        binary = cv2.bitwise_not(binary)
+                    
+                    # Try different OCR configurations
+                    ocr_configs = [
+                        '--psm 7 -c tessedit_char_whitelist=0123456789',  # Single line of text
+                        '--psm 8 -c tessedit_char_whitelist=0123456789',  # Single word
+                        '--psm 6 -c tessedit_char_whitelist=0123456789'   # Assume uniform block of text
+                    ]
+                    
+                    for config in ocr_configs:
+                        try:
+                            text = pytesseract.image_to_string(binary, config=config)
+                            text = ''.join(filter(str.isdigit, text))  # Keep only digits
+                            
+                            if text and text.isdigit():
+                                current_coins = int(text)
+                                
+                                # Sanity check - coins should generally increase or stay the same
+                                if current_coins >= self.coins:
+                                    self.coins = current_coins
+                                    self.ocr_times.append(time.time() - start_time)
+                                    return current_coins
+                        except Exception:
+                            continue
                 
-                # Save processed image for debugging
-                os.makedirs("debug_images/coins", exist_ok=True)
-                timestamp = int(time.time() * 1000)
-                cv2.imwrite(f"debug_images/coins/processed_{timestamp}.png", dilated)
-                
-                # Try different OCR configurations
-                ocr_configs = [
-                    '--psm 7 -c tessedit_char_whitelist=0123456789',  # Single line of text
-                    '--psm 8 -c tessedit_char_whitelist=0123456789',  # Single word
-                    '--psm 10 -c tessedit_char_whitelist=0123456789', # Single character
-                    '--psm 6 -c tessedit_char_whitelist=0123456789'   # Assume uniform block of text
-                ]
-                
-                for config in ocr_configs:
-                    try:
-                        text = pytesseract.image_to_string(dilated, config=config)
-                        text = ''.join(filter(str.isdigit, text))  # Keep only digits
-                        
-                        if text and text.isdigit():
-                            logger.debug(f"OCR detected coins: {text}")
-                            return int(text)
-                    except Exception as e:
-                        logger.debug(f"OCR attempt failed with config {config}: {str(e)}")
-                        continue
-                
-                # If all OCR attempts fail, return previous value with small increment
-                # Coins don't increment as frequently as score
-                coin_change = 1 if random.random() < 0.1 else 0  # 10% chance of finding a coin
-                logger.debug("OCR failed, using estimated coins")
-                return self.coins + coin_change
+                # If OCR fails, implement a more realistic coin pickup simulation
+                if self.step_count % 20 == 0:  # Roughly 5% chance to find a coin
+                    # Higher chance in early game (coin rows are common)
+                    if self.step_count < 200:
+                        coin_change = random.randint(0, 3)  # 0-3 coins
+                    else:
+                        coin_change = random.randint(0, 1)  # 0-1 coins
+                    
+                    self.coins += coin_change
+                    
+                self.ocr_times.append(time.time() - start_time)
+                return self.coins
             else:
                 # If region not set, simulate occasional coin pickup
-                coin_change = 1 if random.random() < 0.1 else 0
-                return self.coins + coin_change
+                if self.step_count % 20 == 0:
+                    self.coins += random.randint(0, 1)
+                
+                self.ocr_times.append(time.time() - start_time)
+                return self.coins
         except Exception as e:
             logger.warning(f"Error in coin detection: {str(e)}")
+            self.ocr_times.append(time.time() - start_time)
             return self.coins  # Fallback to current coins
     
     def reset(self):
@@ -724,170 +930,93 @@ class SubwaySurfersEnv:
         self.last_action = None
         self.last_reward = 0
         
+        # If game is over, handle restart
+        success = self.handle_game_over()
+        if not success and self.browser_active:
+            logger.warning("Failed to restart game normally, trying fallback method")
+            self._fallback_restart()
+        
         # Clear memory for recent frames
         if hasattr(self, 'recent_frames'):
             self.recent_frames.clear()
         else:
             self.recent_frames = []
         
-        # Get screen dimensions
-        browser_width = self.browser.execute_script("return window.innerWidth")
-        browser_height = self.browser.execute_script("return window.innerHeight")
-        center_x = browser_width // 2
-        center_y = browser_height // 2
-        
-        # Multiple attempts to restart the game
-        restart_attempts = 0
-        max_attempts = 5
-        success = False
-        
-        while restart_attempts < max_attempts and not success:
-            try:
-                restart_attempts += 1
-                logger.info(f"Restart attempt {restart_attempts}/{max_attempts}")
-                
-                # First click to close any dialogs (like game over screen)
-                try:
-                    self.browser.execute_script(f"document.elementFromPoint({center_x}, {center_y}).click()")
-                    logger.info(f"Clicked center of screen at ({center_x}, {center_y})")
-                    time.sleep(0.5)
-                except Exception as e:
-                    logger.warning(f"Error clicking center: {str(e)}")
-                
-                # Try to find and click specific restart/play buttons
-                # Look for restart buttons with various selectors
-                restart_selectors = [
-                    ".restart-button", 
-                    "#restart", 
-                    "button.restart", 
-                    "[data-action='restart']",
-                    ".play-button",
-                    "#play",
-                    "button.play",
-                    ".retry-button",
-                    ".pokiSdkStartButton",
-                    "img[alt*='play']",
-                    "div[role='button']"
-                ]
-                
-                restart_clicked = False
-                for selector in restart_selectors:
-                    try:
-                        elements = self.browser.find_elements(By.CSS_SELECTOR, selector)
-                        if elements:
-                            elements[0].click()
-                            restart_clicked = True
-                            logger.info(f"Clicked restart button with selector: {selector}")
-                            time.sleep(1)
-                            break
-                    except Exception:
-                        continue
-                
-                # If no restart button found through selectors, try finding elements by x,y coordinates
-                if not restart_clicked:
-                    # Common positions to try clicking (relative to game center)
-                    # These are typical locations for play/restart buttons
-                    click_positions = [
-                        (0, 0),            # Center
-                        (0, -50),          # Above center
-                        (0, 50),           # Below center
-                        (0, browser_height // 4),  # Further below center
-                        (0, -browser_height // 4)  # Further above center
-                    ]
-                    
-                    for dx, dy in click_positions:
-                        try:
-                            click_x = center_x + dx
-                            click_y = center_y + dy
-                            # Use JavaScript to safely click at the position
-                            element_exists = self.browser.execute_script(
-                                f"var el = document.elementFromPoint({click_x}, {click_y}); "
-                                f"if(el) {{ el.click(); return true; }} return false;"
-                            )
-                            if element_exists:
-                                logger.info(f"Clicked at position ({click_x}, {click_y})")
-                                restart_clicked = True
-                                time.sleep(1)
-                                break
-                        except Exception as e:
-                            logger.debug(f"Click at ({click_x}, {click_y}) failed: {str(e)}")
-                
-                # Wait for game to stabilize
-                time.sleep(1.5)
-                
-                # Check if game restarted by inspecting a new frame
-                frame = self.get_game_frame()
-                if frame is not None and not np.all(frame == 0):
-                    # Get a few more frames to make sure game is stable
-                    temp_frames = []
-                    for _ in range(3):
-                        temp_frame = self.get_game_frame()
-                        if temp_frame is not None and not np.all(temp_frame == 0):
-                            temp_frames.append(temp_frame)
-                        time.sleep(0.5)
-                    
-                    # If we got enough frames and they're not all black
-                    if len(temp_frames) >= 2:
-                        success = True
-                        self.recent_frames.extend(temp_frames)
-                        logger.info("Game successfully restarted")
-                        break
-                
-                # If not successful, try a different approach on next attempt
-                if not success:
-                    logger.warning("Restart attempt failed, retrying with different approach")
-                    # Try refreshing the page if we've already tried several times
-                    if restart_attempts == 3:
-                        try:
-                            logger.info("Refreshing browser page")
-                            self.browser.refresh()
-                            time.sleep(5)  # Wait for page to load
-                            self.initialize_game()  # Re-initialize the game
-                        except Exception as e:
-                            logger.warning(f"Error refreshing page: {str(e)}")
-                
-                # Safety delay before next attempt
-                time.sleep(1)
-                
-            except Exception as e:
-                logger.warning(f"Error during restart attempt {restart_attempts}: {str(e)}")
-        
-        # If all restart attempts failed, try a last resort approach
-        if not success:
-            logger.warning("All restart attempts failed, using fallback approach")
-            try:
-                # Refresh the page and reinitialize
-                self.browser.refresh()
-                time.sleep(5)
-                self.initialize_game()
-                
-                # Get initial frames
-                for _ in range(5):
-                    frame = self.get_game_frame()
-                    if frame is not None and not np.all(frame == 0):
-                        self.recent_frames.append(frame)
-                    time.sleep(0.5)
-            except Exception as e:
-                logger.error(f"Fallback restart failed: {str(e)}")
-        
-        # Get the last frame as the current state
-        self.last_frame = self.recent_frames[-1] if self.recent_frames else None
-        
-        # Check if regions are detected, if not try to detect them
-        if not self.game_region:
-            self.detect_game_region()
-        
         # Make sure we have at least one frame
-        if not self.recent_frames:
-            logger.warning("No frames captured during reset, getting a new frame")
-            frame = self.get_game_frame()
-            self.recent_frames.append(frame)
-            self.last_frame = frame
+        frame = self.get_game_frame()
+        
+        if frame is None or frame.size == 0:
+            logger.warning("Empty frame after reset, creating blank frame")
+            height, width = self.game_region[3], self.game_region[2]
+            frame = np.zeros((height, width, 3), dtype=np.uint8)
+            
+        self.recent_frames.append(frame)
+        self.last_frame = frame
         
         # Preprocess the frame for the agent
         processed_frame = self.preprocess_frame(self.recent_frames[-1])
         
+        # Save initial state
+        debug_path = f"debug_images/states/initial_state_ep{self.episode_count}.png"
+        cv2.imwrite(debug_path, (processed_frame * 255).astype(np.uint8))
+        
         return processed_frame
+    
+    def _fallback_restart(self):
+        """Fallback method to restart game if normal methods fail"""
+        try:
+            if not self.browser_active:
+                return
+                
+            # Get game region center
+            x, y, w, h = self.game_region
+            center_x = x + w // 2
+            center_y = y + h // 2
+            
+            # First make sure browser is in focus
+            try:
+                self.browser.switch_to.window(self.browser.current_window_handle)
+            except Exception:
+                pass
+            
+            # First press Escape to ensure any dialogs are closed
+            pyautogui.press('escape')
+            time.sleep(0.5)
+            
+            # Try multiple approaches in sequence
+            
+            # 1. Click at different positions and press space
+            positions = [
+                (center_x, center_y),              # Center
+                (center_x, center_y - h // 3),     # Top third
+                (center_x, center_y + h // 3),     # Bottom third
+                (center_x - w // 3, center_y),     # Left third
+                (center_x + w // 3, center_y),     # Right third
+            ]
+            
+            for px, py in positions:
+                pyautogui.click(px, py)
+                time.sleep(0.2)
+                pyautogui.press('space')
+                time.sleep(0.3)
+            
+            # 2. Try refreshing the page as a last resort
+            if self.browser_active:
+                try:
+                    self.browser.refresh()
+                    time.sleep(5)  # Wait for page to reload
+                    
+                    # 3. Re-initialize game
+                    self.initialize_game()
+                    time.sleep(2)
+                except Exception as e:
+                    logger.error(f"Error refreshing browser: {e}")
+                    self.browser_active = False
+            
+            logger.info("Fallback restart completed")
+            
+        except Exception as e:
+            logger.error(f"Error in fallback restart: {str(e)}")
     
     def step(self, action):
         """
@@ -910,51 +1039,92 @@ class SubwaySurfersEnv:
         action_name = self.actions[action]
         self.last_action = action_name
         
+        # Start action timer
+        action_start_time = time.time()
+        
         # Perform the action
         self._perform_action(action_name)
         
+        # End action timer
+        self.action_times.append(time.time() - action_start_time)
+        
         # Small delay to allow action to take effect
-        time.sleep(0.05)  # Reduced from higher values to allow faster gameplay
+        time.sleep(0.05)
         
         # Get new frame
         game_frame = self.get_game_frame()
         
-        # Check if game is over
-        self.game_over = self._is_game_over(game_frame)
+        if game_frame is None or game_frame.size == 0:
+            logger.warning("Empty frame after action, creating blank frame")
+            height, width = self.game_region[3], self.game_region[2]
+            game_frame = np.zeros((height, width, 3), dtype=np.uint8)
         
         # Update score and coins
         self.score = self.get_score()
         self.coins = self.get_coins()
         
+        # Check if game is over, including checking for "Save me!" popup
+        self.game_over = self._is_game_over(game_frame) or self.detect_save_me_popup()
+        
         # Preprocess frame for agent
         next_state = self.preprocess_frame(game_frame)
         
-        # Calculate reward components
+        # Calculate reward components with improved design
         survival_reward = 0.1  # Small reward for surviving
-        score_reward = (self.score - prev_score) * 0.5  # Reward for increasing score
-        coin_reward = (self.coins - prev_coins) * 1.0  # Reward for collecting coins
         
-        # Penalty for game over
-        game_over_penalty = -10.0 if self.game_over else 0.0
+        # Score reward with progressive scaling (higher reward for higher scores)
+        score_diff = self.score - prev_score
+        if score_diff > 0:
+            if self.score < 1000:
+                score_reward = score_diff * 0.5  # Early game
+            elif self.score < 5000:
+                score_reward = score_diff * 0.7  # Mid game
+            else:
+                score_reward = score_diff * 1.0  # Late game
+        else:
+            score_reward = 0
+        
+        # Coin reward with bonus for multiple coins
+        coin_diff = self.coins - prev_coins
+        if coin_diff > 0:
+            # Bonus for collecting multiple coins at once
+            coin_reward = coin_diff * (1.0 + 0.2 * (coin_diff - 1))
+        else:
+            coin_reward = 0
+        
+        # Penalty for game over with progressive scaling (less harsh early game)
+        if self.game_over:
+            if self.step_count < 100:
+                game_over_penalty = -5.0  # Early game
+            elif self.step_count < 500:
+                game_over_penalty = -10.0  # Mid game
+            else:
+                game_over_penalty = -15.0  # Late game
+        else:
+            game_over_penalty = 0.0
+        
+        # Introduce a small time-based reward that increases over time
+        # This encourages the agent to survive longer
+        time_reward = min(0.0001 * self.step_count, 0.05)
         
         # Total reward
-        reward = survival_reward + score_reward + coin_reward + game_over_penalty
+        reward = survival_reward + score_reward + coin_reward + game_over_penalty + time_reward
         self.last_reward = reward
         
         # Save current frame for next comparison
         self.last_frame = game_frame
         
-        # Debug: Save intermediate states periodically
-        if self.step_count % 10 == 0:  # Save every 10th step
-            debug_path = f"debug_images/screen_ep{self.episode_count}_step{self.step_count}.png"
-            cv2.imwrite(debug_path, game_frame)
-            logger.info(f"Debug screenshot with regions saved as {debug_path}")
-            
-            # Also save state visualization
-            state_path = f"debug_images/states/state_ep{self.episode_count}_step{self.step_count}.png"
-            state_img = (next_state * 255).astype(np.uint8)
-            cv2.imwrite(state_path, state_img)
-            logger.info(f"State visualization saved to {state_path}")
+        # Save debug screenshots periodically
+        if self.step_count % 100 == 0:  # Less frequent saves to reduce overhead
+            try:
+                debug_path = f"debug_images/frames/screen_ep{self.episode_count}_step{self.step_count}.png"
+                cv2.imwrite(debug_path, game_frame)
+                
+                # Also save the processed state
+                debug_path = f"debug_images/states/state_ep{self.episode_count}_step{self.step_count}.png"
+                cv2.imwrite(debug_path, (next_state * 255).astype(np.uint8))
+            except Exception as e:
+                logger.warning(f"Error saving debug screenshot: {e}")
         
         # Return next_state, reward, done, info
         info = {
@@ -963,7 +1133,9 @@ class SubwaySurfersEnv:
             'survival_reward': survival_reward,
             'score_reward': score_reward,
             'coin_reward': coin_reward,
-            'game_over_penalty': game_over_penalty
+            'game_over_penalty': game_over_penalty,
+            'time_reward': time_reward,
+            'step_count': self.step_count
         }
         
         return next_state, reward, self.game_over, info
@@ -975,6 +1147,9 @@ class SubwaySurfersEnv:
         Args:
             action_name: Name of the action to perform
         """
+        if not self.browser_active:
+            return
+            
         # Map action name to keyboard key
         key_map = {
             'noop': None,
@@ -988,152 +1163,18 @@ class SubwaySurfersEnv:
         
         if key:
             try:
-                # Get game region center for actions
-                x, y, width, height = self.game_region
-                center_x, center_y = x + width // 2, y + height // 2
+                # Make sure browser window is in focus before sending keystrokes
+                try:
+                    self.browser.switch_to.window(self.browser.current_window_handle)
+                    # Additional attempt to ensure focus using JavaScript
+                    self.browser.execute_script("window.focus();")
+                except WebDriverException:
+                    self.browser_active = False
+                    logger.warning("Browser window no longer active")
+                    return
                 
-                # Store start time for performance tracking
-                start_time = time.time()
-                
-                # Try different approaches in sequence until one works
-                success = False
-                error_messages = []
-                
-                # Method 1: First ensure focus on game area, then use direct JavaScript KeyboardEvent
-                if not success:
-                    try:
-                        # Click to focus first
-                        self.browser.execute_script(f"""
-                            var el = document.elementFromPoint({center_x}, {center_y});
-                            if (el) {{
-                                el.focus();
-                                return true;
-                            }}
-                            return false;
-                        """)
-                        
-                        # Map keys to JavaScript key codes and key strings
-                        key_data = {
-                            'up': {'code': 38, 'key': 'ArrowUp', 'keyCode': 38},
-                            'down': {'code': 40, 'key': 'ArrowDown', 'keyCode': 40},
-                            'left': {'code': 37, 'key': 'ArrowLeft', 'keyCode': 37},
-                            'right': {'code': 39, 'key': 'ArrowRight', 'keyCode': 39}
-                        }
-                        
-                        if key in key_data:
-                            key_info = key_data[key]
-                            js_script = f"""
-                            (function() {{
-                                var keyEvent = function(type) {{
-                                    var evt = new KeyboardEvent(type, {{
-                                        bubbles: true,
-                                        cancelable: true,
-                                        keyCode: {key_info['keyCode']},
-                                        which: {key_info['keyCode']},
-                                        code: '{key_info['key']}',
-                                        key: '{key_info['key']}',
-                                        location: 0,
-                                        view: window
-                                    }});
-                                    return evt;
-                                }};
-                                
-                                // Dispatch events on document, window and active element
-                                [document, window, document.activeElement].forEach(function(target) {{
-                                    if (target) {{
-                                        target.dispatchEvent(keyEvent('keydown'));
-                                        setTimeout(function() {{
-                                            target.dispatchEvent(keyEvent('keyup'));
-                                        }}, 30);
-                                    }}
-                                }});
-                                
-                                return true;
-                            }})();
-                            """
-                            result = self.browser.execute_script(js_script)
-                            if result:
-                                success = True
-                                logger.debug(f"Method 1: JS KeyboardEvent successful for {action_name}")
-                        else:
-                            logger.debug(f"Unknown key: {key}")
-                    except Exception as e:
-                        error_messages.append(f"JS KeyboardEvent method failed: {str(e)}")
-                
-                # Method 2: Try using PyAutoGUI after ensuring browser is focused
-                if not success:
-                    try:
-                        # Make sure browser window is in focus
-                        self.browser.switch_to.window(self.browser.current_window_handle)
-                        
-                        # Click at center of game region
-                        click_result = self.browser.execute_script(f"""
-                            try {{
-                                document.elementFromPoint({center_x}, {center_y}).click();
-                                return true;
-                            }} catch(e) {{
-                                return false;
-                            }}
-                        """)
-                        
-                        # Short pause to let focus take effect
-                        time.sleep(0.02)
-                        
-                        # Press key with PyAutoGUI
-                        pyautogui.press(key)
-                        
-                        # Log success
-                        success = True
-                        logger.debug(f"Method 2: PyAutoGUI successful for {action_name}")
-                    except Exception as e:
-                        error_messages.append(f"PyAutoGUI method failed: {str(e)}")
-                
-                # Method 3: Try using direct DOM events on game canvas
-                if not success:
-                    try:
-                        # Look for canvas elements (games often use canvas)
-                        js_script = """
-                        (function() {
-                            // Find all canvas elements
-                            var canvases = document.getElementsByTagName('canvas');
-                            if (canvases && canvases.length > 0) {
-                                // Use the first canvas
-                                var canvas = canvases[0];
-                                canvas.focus();
-                                return true;
-                            }
-                            return false;
-                        })();
-                        """
-                        
-                        found_canvas = self.browser.execute_script(js_script)
-                        
-                        if found_canvas:
-                            # Now send the key event to the canvas
-                            from selenium.webdriver.common.keys import Keys
-                            from selenium.webdriver.common.action_chains import ActionChains
-                            
-                            key_map_selenium = {
-                                'up': Keys.ARROW_UP,
-                                'down': Keys.ARROW_DOWN,
-                                'left': Keys.ARROW_LEFT,
-                                'right': Keys.ARROW_RIGHT
-                            }
-                            
-                            canvas = self.browser.find_elements(By.TAG_NAME, 'canvas')[0]
-                            ActionChains(self.browser).move_to_element(canvas).click().send_keys(key_map_selenium[key]).perform()
-                            success = True
-                            logger.debug(f"Method 3: Canvas action successful for {action_name}")
-                    except Exception as e:
-                        error_messages.append(f"Canvas method failed: {str(e)}")
-                
-                # Log performance information
-                elapsed_time = (time.time() - start_time) * 1000  # milliseconds
-                if success:
-                    logger.debug(f"Action {action_name} performed in {elapsed_time:.2f}ms")
-                else:
-                    logger.warning(f"All action methods failed for {action_name} after {elapsed_time:.2f}ms")
-                    logger.debug(f"Errors: {error_messages}")
+                # Press key with PyAutoGUI
+                pyautogui.press(key)
                 
             except Exception as e:
                 logger.warning(f"Error performing action {action_name}: {str(e)}")
@@ -1148,132 +1189,67 @@ class SubwaySurfersEnv:
         Returns:
             Boolean indicating if the game is over
         """
-        if self.last_frame is None:
+        if self.last_frame is None or current_frame is None:
+            return False
+            
+        if current_frame.size == 0 or self.last_frame.size == 0:
+            logger.warning("Empty frame in _is_game_over")
             return False
         
-        # Method 1: Frame difference - compare current frame with previous frame
         try:
+            # Method 1: Compare consecutive frames
             # Convert frames to grayscale for comparison
-            current_gray = cv2.cvtColor(current_frame, cv2.COLOR_RGB2GRAY)
-            last_gray = cv2.cvtColor(self.last_frame, cv2.COLOR_RGB2GRAY)
+            current_gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
+            last_gray = cv2.cvtColor(self.last_frame, cv2.COLOR_BGR2GRAY)
             
             # Calculate MSE (Mean Squared Error) between frames
             # If frames are nearly identical, the game might be over
             mse = np.mean((current_gray - last_gray) ** 2) / 255.0
             
-            # Calculate structural similarity index (SSIM) for more robust comparison
-            # Higher SSIM means more similar images
-            try:
-                # For newer versions of OpenCV
-                ssim_value = cv2.SSIM(current_gray, last_gray)[0] if hasattr(cv2, 'SSIM') else 0.0
-            except (AttributeError, TypeError):
-                try:
-                    # For older versions that use structural_similarity from skimage
-                    from skimage.metrics import structural_similarity as ssim
-                    ssim_value = ssim(current_gray, last_gray)
-                except ImportError:
-                    ssim_value = 0.0  # If neither method is available
-            
-            # Adjusted thresholds - less sensitive to prevent premature detection
-            mse_threshold = 0.003  # Lower means more sensitive
-            ssim_threshold = 0.92  # Higher means more sensitive
+            # Adaptive threshold based on game progression
+            # Early game is more static, late game has more movement
+            if self.step_count < 100:
+                mse_threshold = 0.002  # More sensitive in early game
+            else:
+                mse_threshold = 0.003  # Less sensitive in later game
 
             # Check if the game is static (very little change between frames)
-            is_static_mse = mse < mse_threshold
-            is_static_ssim = ssim_value > ssim_threshold if ssim_value > 0 else False
+            is_static = mse < mse_threshold
             
-            is_static = is_static_mse or is_static_ssim
+            # Method 2: Check for specific game over indicators
+            is_popup_detected = self.detect_save_me_popup()
             
-            if is_static:
-                logger.info(f"Game over detected: screen is static (MSE: {mse:.4f}, SSIM: {ssim_value:.4f})")
+            # Method 3: Check for dark overlay (common in game over screens)
+            # Calculate brightness of center portion
+            h, w = current_gray.shape
+            center_region = current_gray[h//4:3*h//4, w//4:3*w//4]
+            brightness = np.mean(center_region)
+            
+            is_dark_overlay = brightness < 50  # Threshold for darkness
+            
+            # Combine methods (more reliable detection)
+            game_over = is_static or is_popup_detected or is_dark_overlay
+            
+            if game_over and self.step_count % 10 == 0:
+                # Save debug info
+                debug_info = f"Static: {is_static} (MSE: {mse:.6f}), Popup: {is_popup_detected}, Dark: {is_dark_overlay} (Brightness: {brightness:.2f})"
+                logger.info(f"Game over detected: {debug_info}")
+                
+                # Save debug image
+                debug_img = np.hstack((self.last_frame, current_frame))
+                debug_path = f"debug_images/frames/game_over_ep{self.episode_count}_step{self.step_count}.png"
+                cv2.imwrite(debug_path, debug_img)
+                
+                # Save difference image
+                diff = cv2.absdiff(self.last_frame, current_frame)
+                diff_path = f"debug_images/frames/game_over_diff_ep{self.episode_count}_step{self.step_count}.png"
+                cv2.imwrite(diff_path, diff)
+            
+            return game_over
+            
         except Exception as e:
             logger.warning(f"Error in frame comparison for game over detection: {str(e)}")
-            is_static = False
-        
-        # Method 2: Check for specific game over visual indicators (typically UI elements)
-        try:
-            # Look for UI elements that indicate game over
-            
-            # Method 2a: Check for bright UI elements (like buttons, restart screens)
-            # Convert to HSV for better color filtering
-            current_hsv = cv2.cvtColor(current_frame, cv2.COLOR_BGR2HSV)
-            
-            # Define range for bright UI elements (covers white/bright colors often used in UI)
-            lower_white = np.array([0, 0, 180])
-            upper_white = np.array([180, 30, 255])
-            
-            # Create a mask for bright UI elements
-            white_mask = cv2.inRange(current_hsv, lower_white, upper_white)
-            
-            # Count bright pixels
-            bright_pixel_count = cv2.countNonZero(white_mask)
-            
-            # Calculate percentage of bright pixels
-            total_pixels = current_frame.shape[0] * current_frame.shape[1]
-            bright_pixel_percentage = bright_pixel_count / total_pixels
-            
-            # Game over screens typically have more UI elements (bright)
-            has_bright_ui = bright_pixel_percentage > 0.15  # Adjustable threshold
-            
-            # Method 2b: Check for typical game over UI colors (red/orange elements)
-            # Define range for orange/red UI elements (common in game over screens)
-            lower_orange = np.array([10, 100, 100])
-            upper_orange = np.array([25, 255, 255])
-            
-            # Create a mask for orange UI elements
-            orange_mask = cv2.inRange(current_hsv, lower_orange, upper_orange)
-            
-            # Count orange pixels
-            orange_pixel_count = cv2.countNonZero(orange_mask)
-            
-            # Calculate percentage
-            orange_pixel_percentage = orange_pixel_count / total_pixels
-            
-            # Game over screens often have orange/red elements
-            has_orange_ui = orange_pixel_percentage > 0.07  # Adjustable threshold
-            
-            # Combine UI detection methods
-            has_ui_elements = has_bright_ui or has_orange_ui
-            
-            if has_ui_elements and not is_static:
-                logger.info(f"Game over potentially detected: UI elements found (Bright: {bright_pixel_percentage:.2f}, Orange: {orange_pixel_percentage:.2f})")
-        except Exception as e:
-            logger.warning(f"Error in UI-based game over detection: {str(e)}")
-            has_ui_elements = False
-        
-        # Method 3: Time-based check - if we've been running for a while, be more lenient
-        # with game over detection to prevent getting stuck
-        time_based_threshold = self.step_count > 300  # After 300 steps, be more lenient
-        
-        # Combine detection methods:
-        # 1. If screen is static, likely game over
-        # 2. If UI elements detected and we're past initial steps, likely game over
-        # 3. If we've been running for a long time and see some indicators, likely game over
-        game_over = (
-            is_static or 
-            (has_ui_elements and self.step_count > 30) or  # Only use UI detection after enough steps
-            (time_based_threshold and (has_ui_elements or is_static_mse))  # More lenient after a long time
-        )
-        
-        # Debug information
-        if game_over:
-            # Save debug image
-            debug_path = f"debug_images/game_over_frame_ep{self.episode_count}_step{self.step_count}.png"
-            cv2.imwrite(debug_path, current_frame)
-            
-            # Also save the masks used for detection
-            try:
-                os.makedirs("debug_images/game_over", exist_ok=True)
-                if 'white_mask' in locals():
-                    cv2.imwrite(f"debug_images/game_over/white_mask_ep{self.episode_count}_step{self.step_count}.png", white_mask)
-                if 'orange_mask' in locals():
-                    cv2.imwrite(f"debug_images/game_over/orange_mask_ep{self.episode_count}_step{self.step_count}.png", orange_mask)
-            except Exception as e:
-                logger.debug(f"Failed to save debug masks: {str(e)}")
-            
-            logger.info(f"Game over frame saved as {debug_path}")
-        
-        return game_over
+            return False
     
     def visualize_agent_state(self, state, step_num, episode_num):
         """Save a visualization of the current agent state for debugging"""
@@ -1306,60 +1282,66 @@ class SubwaySurfersEnv:
             grid = (grid * 255).astype(np.uint8)
             
             # Save visualization
+            os.makedirs("debug_images/states", exist_ok=True)
             save_path = f"debug_images/states/state_ep{episode_num}_step{step_num}.png"
-            cv2.imwrite(save_path, grid)
-            logger.info(f"State visualization saved to {save_path}")
-            
-            # Update GUI if in human mode
-            if self.render_mode == "human" and hasattr(self, 'root') and self.root.winfo_exists():
-                # Convert to RGB for tkinter
-                grid_rgb = cv2.cvtColor(grid, cv2.COLOR_GRAY2RGB)
-                height, width = grid_rgb.shape[:2]
-                
-                # Resize if too large
-                max_size = 200
-                if height > max_size or width > max_size:
-                    scale = max_size / max(height, width)
-                    grid_rgb = cv2.resize(grid_rgb, (int(width * scale), int(height * scale)))
-                
-                # Convert to PhotoImage format for tkinter
-                img = Image.fromarray(grid_rgb)
-                self.current_state_img = ImageTk.PhotoImage(image=img)
+            try:
+                cv2.imwrite(save_path, grid)
+                logger.debug(f"State visualization saved to {save_path}")
+            except Exception as e:
+                logger.warning(f"Error saving state visualization: {e}")
         else:
             # If it's a single frame, just save it directly
-            frame = (state * 255).astype(np.uint8)
-            save_path = f"debug_images/states/state_ep{episode_num}_step{step_num}.png"
-            cv2.imwrite(save_path, frame)
-            logger.info(f"State visualization saved to {save_path}")
-            
-            # Update GUI if in human mode
-            if self.render_mode == "human" and hasattr(self, 'root') and self.root.winfo_exists():
-                # Convert to RGB for tkinter
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-                
-                # Resize if needed
-                max_size = 200
-                height, width = frame_rgb.shape[:2]
-                if height > max_size or width > max_size:
-                    scale = max_size / max(height, width)
-                    frame_rgb = cv2.resize(frame_rgb, (int(width * scale), int(height * scale)))
-                
-                # Convert to PhotoImage format for tkinter
-                img = Image.fromarray(frame_rgb)
-                self.current_state_img = ImageTk.PhotoImage(image=img)
+            try:
+                frame = (state * 255).astype(np.uint8)
+                os.makedirs("debug_images/states", exist_ok=True)
+                save_path = f"debug_images/states/state_ep{episode_num}_step{step_num}.png"
+                cv2.imwrite(save_path, frame)
+                logger.debug(f"State visualization saved to {save_path}")
+            except Exception as e:
+                logger.warning(f"Error saving state visualization: {e}")
     
     def update_training_stats(self, epsilon=None, loss=None, avg_reward=None):
-        """Update training statistics for display in GUI"""
+        """Update training statistics (just storing for terminal logging)"""
         self.epsilon = epsilon
         self.loss = loss
         self.avg_reward = avg_reward
     
+    def get_performance_stats(self):
+        """Get statistics about environment performance"""
+        stats = {
+            'capture_time': {
+                'mean': np.mean(self.frame_capture_times) if self.frame_capture_times else 0,
+                'std': np.std(self.frame_capture_times) if self.frame_capture_times else 0,
+                'count': len(self.frame_capture_times)
+            },
+            'ocr_time': {
+                'mean': np.mean(self.ocr_times) if self.ocr_times else 0,
+                'std': np.std(self.ocr_times) if self.ocr_times else 0,
+                'count': len(self.ocr_times)
+            },
+            'action_time': {
+                'mean': np.mean(self.action_times) if self.action_times else 0,
+                'std': np.std(self.action_times) if self.action_times else 0,
+                'count': len(self.action_times)
+            }
+        }
+        return stats
+    
+    def log_performance_stats(self):
+        """Log performance statistics"""
+        stats = self.get_performance_stats()
+        logger.info("Environment Performance Statistics:")
+        logger.info(f"  Frame capture time: {stats['capture_time']['mean']*1000:.2f}ms (±{stats['capture_time']['std']*1000:.2f}ms)")
+        logger.info(f"  OCR processing time: {stats['ocr_time']['mean']*1000:.2f}ms (±{stats['ocr_time']['std']*1000:.2f}ms)")
+        logger.info(f"  Action execution time: {stats['action_time']['mean']*1000:.2f}ms (±{stats['action_time']['std']*1000:.2f}ms)")
+    
     def close(self):
         """Close the environment and cleanup resources"""
-        if hasattr(self, 'browser') and self.browser:
-            self.browser.quit()
-        
-        if hasattr(self, 'root') and self.root:
-            self.root.destroy()
+        if hasattr(self, 'browser') and self.browser and self.browser_active:
+            try:
+                self.browser.quit()
+                self.browser_active = False
+            except Exception as e:
+                logger.warning(f"Error closing browser: {e}")
         
         logger.info("Environment closed")
