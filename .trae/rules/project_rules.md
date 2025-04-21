@@ -1,1 +1,0 @@
-always use context as needed and  as this is a python project always first check if the virtual env is present using ```venv/scripts/activate``` and first activate venv and then install anything.

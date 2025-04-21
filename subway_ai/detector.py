@@ -1,4 +1,4 @@
-# Object detector module for Subway Surfers AI
+# Improved detector.py with better play button detection
 import os
 import cv2
 import numpy as np
@@ -9,7 +9,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from subway_ai.config import *
 
 class ObjectDetector:
-    """Simple object detector for Subway Surfers using template matching and color detection"""
+    """Improved object detector for Subway Surfers with more reliable play button detection"""
     
     def __init__(self, template_dir=None):
         """Initialize the detector with templates"""
@@ -18,6 +18,10 @@ class ObjectDetector:
         
         # Load templates if they exist
         self.load_templates(template_dir)
+        
+        # Initialize counters for detection stability
+        self.consecutive_play_button_detections = 0
+        self.consecutive_game_over_detections = 0
         
         print(f"ObjectDetector initialized with {len(self.templates)} templates")
     
@@ -98,101 +102,162 @@ class ObjectDetector:
         
         return None
     
+    def _is_likely_play_button(self, contour, img_shape, min_area=1000):
+        """Determine if a contour is likely to be a play button based on multiple criteria"""
+        area = cv2.contourArea(contour)
+        
+        # Check area size
+        if area < min_area:
+            return False
+        
+        # Get bounding box to analyze shape
+        x, y, w, h = cv2.boundingRect(contour)
+        
+        # Calculate aspect ratio and relative position
+        aspect_ratio = float(w) / h if h > 0 else 0
+        relative_y_pos = y / img_shape[0] if img_shape[0] > 0 else 0
+        
+        # Play button criteria:
+        # 1. Should be somewhat wider than tall (typical button shape)
+        # 2. Should be in the bottom half of the screen
+        # 3. Should have a reasonable size relative to the image
+        is_button_shape = 1.5 < aspect_ratio < 5
+        is_in_bottom_half = relative_y_pos > 0.6
+        relative_size = area / (img_shape[0] * img_shape[1])
+        is_reasonable_size = 0.005 < relative_size < 0.1  # Between 0.5% and 10% of screen
+        
+        return is_button_shape and is_in_bottom_half and is_reasonable_size
+    
     def detect_game_over(self, img, threshold=0.6):
-        """Detect game over screen"""
-        # Try template matching first
-        result = self.detect_template(img, 'game_over', threshold)
-        if result:
-            print(f"Game over detected with confidence {result['confidence']:.2f}")
-            return True
-        
-        # Also check for play button as an indicator of game over
-        play_button = self.detect_template(img, 'play_button', threshold)
-        if play_button:
-            print(f"Play button detected with confidence {play_button['confidence']:.2f}")
-            return True
-        
-        # Convert to proper format for color analysis
+        """Improved game over detection with stability counter"""
+        # Convert to proper format
         if isinstance(img, Image.Image):
             img_np = np.array(img)
         else:
-            img_np = img
+            img_np = img.copy()
         
-        # Check for green play button using color detection
-        if len(img_np.shape) == 3 and img_np.shape[2] == 3:
-            # Convert to HSV color space
-            img_hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
-            
-            # Define range for green color
-            lower_green = np.array([40, 100, 100])
-            upper_green = np.array([80, 255, 255])
-            
-            # Create a mask for green areas
-            green_mask = cv2.inRange(img_hsv, lower_green, upper_green)
-            
-            # Check bottom half of the screen for large green areas (play button)
-            h = green_mask.shape[0]
-            bottom_half = green_mask[h//2:, :]
-            if np.sum(bottom_half) > 10000:  # Significant green area
-                print("Green play button detected in bottom half")
+        # Try template matching first for "Game Over" text
+        result = self.detect_template(img_np, 'game_over', threshold)
+        if result and result['confidence'] > 0.75:  # Higher confidence for game over
+            self.consecutive_game_over_detections += 1
+            if self.consecutive_game_over_detections >= 2:  # Require multiple detections
+                print(f"Game over detected with high confidence {result['confidence']:.2f}")
                 return True
+        
+        # Also check for play button as an indicator of game over, requiring multiple consecutive detections
+        play_button = self.locate_play_button(img_np, threshold=0.65)  # Increased threshold
+        if play_button:
+            self.consecutive_play_button_detections += 1
+            if self.consecutive_play_button_detections >= 3:  # Require 3 consecutive detections
+                print(f"Play button detected consistently - game is likely over")
+                return True
+        else:
+            # Reset counter if no play button detected
+            self.consecutive_play_button_detections = 0
+        
+        # If neither game over text nor play button detected consistently, reset game over counter
+        if not result or result['confidence'] <= 0.75:
+            self.consecutive_game_over_detections = 0
         
         return False
     
-    def locate_play_button(self, img, threshold=0.6):
-        """Locate the play button on the game over screen"""
-        # Try template matching first
+    def locate_play_button(self, img, threshold=0.65):
+        """Improved locate play button function with more robust color detection"""
+        # Try template matching first (higher threshold for more confidence)
         result = self.detect_template(img, 'play_button', threshold)
-        if result:
+        if result and result['confidence'] > 0.7:  # Higher confidence threshold
             # Return center coordinates
             center_x = result['center'][0] + GAME_REGION[0]  # Add game region offset
             center_y = result['center'][1] + GAME_REGION[1]
-            print(f"Play button found at ({center_x}, {center_y}) with confidence {result['confidence']:.2f}")
+            print(f"Play button found with high confidence {result['confidence']:.2f} at ({center_x}, {center_y})")
             return (center_x, center_y)
         
         # Convert to proper format for color analysis
         if isinstance(img, Image.Image):
             img_np = np.array(img)
         else:
-            img_np = img
+            img_np = img.copy()
         
-        # Try to find green button using color detection
+        # Try to find green button using improved color detection
         if len(img_np.shape) == 3 and img_np.shape[2] == 3:
             # Convert to HSV color space
             img_hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
             
-            # Define range for green color
-            lower_green = np.array([40, 100, 100])
-            upper_green = np.array([80, 255, 255])
+            # Define more specific range for green play button color
+            # This is a more targeted green range to reduce false positives
+            lower_green = np.array([45, 120, 120])  # More specific green
+            upper_green = np.array([75, 255, 255])  # More specific green
             
             # Create a mask for green areas
             green_mask = cv2.inRange(img_hsv, lower_green, upper_green)
             
+            # Apply morphology to clean the mask (remove noise)
+            kernel = np.ones((5, 5), np.uint8)
+            green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
+            green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel)
+            
             # Find contours of green areas
             contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Check if we have significant green areas
+            if np.sum(green_mask) < 5000:  # Minimum number of green pixels
+                return None
             
             if contours:
                 # Sort contours by area (largest first)
                 contours = sorted(contours, key=cv2.contourArea, reverse=True)
                 
                 for contour in contours:
-                    area = cv2.contourArea(contour)
-                    if area > 1000:  # Min area threshold
-                        # Get bounding box
+                    # Check if contour is likely a play button using multiple criteria
+                    if self._is_likely_play_button(contour, img_np.shape[:2]):
+                        # Get bounding box and center point
                         x, y, w, h = cv2.boundingRect(contour)
+                        center_x = x + w//2 + GAME_REGION[0]
+                        center_y = y + h//2 + GAME_REGION[1]
                         
-                        # Check if in bottom half of screen (play button location)
-                        if y > img_np.shape[0] * 0.5:
-                            center_x = x + w//2 + GAME_REGION[0]
-                            center_y = y + h//2 + GAME_REGION[1]
-                            print(f"Play button found using color detection at ({center_x}, {center_y})")
+                        # Additional validation: check for symmetry typical of buttons
+                        symmetry_score = self._calculate_symmetry(green_mask, x, y, w, h)
+                        if symmetry_score > 0.7:  # High symmetry requirement
+                            print(f"Play button found using enhanced color detection at ({center_x}, {center_y})")
                             return (center_x, center_y)
         
-        # Fall back to a predefined position
-        center_x = GAME_REGION[0] + GAME_REGION[2] // 2
-        center_y = GAME_REGION[1] + GAME_REGION[3] - 60  # Near bottom
-        print(f"Using fallback play button position at ({center_x}, {center_y})")
-        return (center_x, center_y)
+        # If no play button detected by reliable methods, don't use fallback position
+        # This avoids false positives for play button detection
+        return None
+    
+    def _calculate_symmetry(self, mask, x, y, w, h):
+        """Calculate horizontal symmetry of a potential button region"""
+        if w < 10 or h < 10:  # Too small to check symmetry
+            return 0
+            
+        # Extract region of interest
+        roi = mask[y:y+h, x:x+w]
+        
+        # Split into left and right halves
+        mid = w // 2
+        left_half = roi[:, :mid]
+        right_half = roi[:, mid:2*mid] if 2*mid <= w else roi[:, mid:]
+        
+        # If right half is wider, crop it
+        if right_half.shape[1] > left_half.shape[1]:
+            right_half = right_half[:, :left_half.shape[1]]
+            
+        # If right half is narrower, pad it
+        elif right_half.shape[1] < left_half.shape[1]:
+            pad_width = left_half.shape[1] - right_half.shape[1]
+            right_half = np.pad(right_half, ((0, 0), (0, pad_width)), 'constant')
+        
+        # Flip right half horizontally
+        right_half_flipped = cv2.flip(right_half, 1)
+        
+        # Calculate similarity (intersection over union)
+        intersection = np.logical_and(left_half, right_half_flipped).sum()
+        union = np.logical_or(left_half, right_half_flipped).sum()
+        
+        if union == 0:
+            return 0
+            
+        return intersection / union
     
     def analyze_game_screen(self, img):
         """Analyze the game screen for obstacles and coins"""
@@ -245,24 +310,3 @@ class ObjectDetector:
             print(f"Visualization saved to {save_path}")
         
         return img_vis
-
-# Example usage
-if __name__ == "__main__":
-    # Initialize detector
-    detector = ObjectDetector()
-    
-    # Take a screenshot
-    import pyautogui
-    screenshot = pyautogui.screenshot(region=GAME_REGION)
-    
-    # Analyze the screenshot
-    analysis = detector.analyze_game_screen(screenshot)
-    
-    # Visualize the analysis
-    vis_img = detector.visualize_detection(screenshot, analysis, "detection_result.png")
-    
-    # Display the result
-    if vis_img is not None:
-        cv2.imshow("Detection Result", vis_img)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()

@@ -1,5 +1,6 @@
-# Configuration file for Subway Surfers AI
+# Improved configuration file for Subway Surfers AI
 import os
+import torch
 
 # Game settings
 GAME_PATH = "Subway_Surfers.exe"  # Path to game executable (modify if needed)
@@ -37,11 +38,25 @@ TARGET_UPDATE = 10
 CHECKPOINT_INTERVAL = 5
 SCREENSHOT_INTERVAL = 50
 
+# Device settings
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Detection thresholds
+GAME_OVER_DETECTION_THRESHOLD = 0.7  # Threshold for game over template matching
+PLAY_BUTTON_DETECTION_THRESHOLD = 0.7  # Threshold for play button template matching
+MIN_GREEN_PIXELS = 5000  # Minimum number of green pixels for play button detection
+CONSECUTIVE_DETECTIONS_REQUIRED = 3  # Number of consecutive detections required for stability
+
+# Game control settings
+ACTION_COOLDOWN = 0.25  # Seconds between actions
+RESTART_COOLDOWN = 5.0  # Seconds between restart attempts
+SWIPE_DURATION = 0.15  # Duration of swipe gestures
+
 # Reward settings
-REWARD_SURVIVAL = 0.1    # Small reward for surviving each step
-REWARD_COIN = 1.0        # Reward for collecting a coin
-REWARD_SCORE = 0.02      # Reward multiplier for score increase
-PENALTY_CRASH = -10.0    # Penalty for crashing
+REWARD_SURVIVAL = 0.1     # Small reward for surviving each step
+REWARD_COIN = 1.0         # Reward for collecting a coin
+REWARD_SCORE = 0.02       # Reward multiplier for score increase
+PENALTY_CRASH = -10.0     # Penalty for crashing
 
 # Action space - For swipe controls
 ACTIONS = {
@@ -53,6 +68,27 @@ ACTIONS = {
 }
 NUM_ACTIONS = len(ACTIONS)
 
-# Play button position (fallback)
-PLAY_BUTTON_FALLBACK = (500, 570)  # Green play button at bottom
-COINS_REGION = (1755, 311, 131, 43)
+# Debug settings
+DEBUG_MODE = False  # Set to True to enable additional debug output and visualizations
+
+# Function to load custom settings from a JSON file (if it exists)
+def load_custom_settings():
+    """Load custom settings from settings.json if available"""
+    import json
+    settings_path = os.path.join(BASE_DIR, "settings.json")
+    if os.path.exists(settings_path):
+        try:
+            with open(settings_path, 'r') as f:
+                custom_settings = json.load(f)
+            
+            # Update globals with custom settings
+            globals().update(custom_settings)
+            print(f"Loaded custom settings from {settings_path}")
+        except Exception as e:
+            print(f"Error loading custom settings: {e}")
+
+# Try to load custom settings
+try:
+    load_custom_settings()
+except:
+    pass

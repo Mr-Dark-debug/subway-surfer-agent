@@ -56,7 +56,6 @@ def setup_game():
     os.makedirs("screenshots/gameplay", exist_ok=True)
     os.makedirs("screenshots/score", exist_ok=True)
     os.makedirs("screenshots/coins", exist_ok=True)
-    os.makedirs("screenshots/game_over", exist_ok=True)
     os.makedirs("templates", exist_ok=True)
     os.makedirs("models", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
@@ -256,12 +255,9 @@ class GameStateTracker:
             except Exception as e:
                 print(f"Error creating OCR log file: {e}")
         
-        # Store template images
+        # Store template images (only score screen needed)
         self.templates = {
-            'save_me': None,
-            'score_screen': None,
-            'play_button': None,
-            'free_button': None
+            'score_screen': None
         }
         
         self.try_load_templates()
@@ -469,11 +465,7 @@ class GameStateTracker:
             except Exception as e:
                 print(f"Error logging OCR result: {e}")
     
-    def detect_save_me_screen(self, game_img):
-        """
-        Detect the 'Save me!' screen shown after dying
-        Uses a combination of template matching and color analysis
-        """
+
         # Save the current game image to check later
         if isinstance(game_img, Image.Image):
             img_array = np.array(game_img)

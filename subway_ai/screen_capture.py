@@ -1,3 +1,4 @@
+# Improved screen_capture.py with better game over detection
 import cv2
 from datetime import datetime
 import pyautogui
@@ -8,6 +9,7 @@ import sys
 import pytesseract
 import os
 import numpy as np
+import time
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from subway_ai.config import *
@@ -51,6 +53,13 @@ class ScreenCapture:
         # Load templates
         self.templates = {}
         self.load_templates()
+        
+        # Game state tracking for stability
+        self.consecutive_play_button_detections = 0
+        self.last_known_play_button = None
+        self.consecutive_identical_scores = 0
+        self.game_active = False
+        self.last_game_over_check_time = time.time()
         
         print(f"Screen capture initialized with regions:")
         print(f"Game region: {GAME_REGION}")
@@ -133,13 +142,28 @@ class ScreenCapture:
         else:
             gray = img_array.copy()
         
-        # 2. Apply thresholding for better OCR
+        # 2. Apply adaptive thresholding for better OCR (improved method)
         if is_score:
-            # For score - white text on blue background
-            _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+            # For score - typically white text on blue/dark background
+            # Try adaptive thresholding which works better with varying lighting
+            binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                          cv2.THRESH_BINARY, 21, 10)
         else:
             # For coins - usually yellow/gold on dark background
-            _, binary = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY)
+            # First enhance yellow/gold colors in original image
+            if len(img_array.shape) == 3:
+                # Convert to HSV
+                hsv = cv2.cvtColor(img_array, cv2.COLOR_RGB2HSV)
+                # Yellow mask
+                lower_yellow = np.array([20, 100, 100])
+                upper_yellow = np.array([40, 255, 255])
+                yellow_mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
+                # Combine with grayscale for better results
+                binary = cv2.bitwise_or(gray, yellow_mask)
+                _, binary = cv2.threshold(binary, 100, 255, cv2.THRESH_BINARY)
+            else:
+                # If already grayscale
+                _, binary = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY)
         
         # 3. Apply morphological operations to clean up the image
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
@@ -178,14 +202,35 @@ class ScreenCapture:
             # Apply consistency check
             if self.last_score > 0:
                 # Score typically increases gradually in Subway Surfers
-                max_increase = 50  # Maximum reasonable score increase between frames
+                max_increase = 100  # Maximum reasonable score increase between frames
                 
                 if score > self.last_score + max_increase:
-                    # Probably a misread, use a reasonable increment
-                    score = self.last_score + 10
+                    # Large jumps are suspicious - check if it's a clean read
+                    if len(digits_only) != len(str(self.last_score)):
+                        # Different number of digits - likely misread
+                        score = self.last_score + 10  # Use modest increment
+                    elif score > self.last_score * 2:
+                        # More than doubled - highly suspicious
+                        score = self.last_score + 10
                 elif score < self.last_score:
                     # Scores shouldn't decrease during gameplay
-                    score = self.last_score + 1  # Slight increment to show progress
+                    # Check if the decrease is significant
+                    if self.last_score - score > 50:
+                        # Significant decrease - likely a misread
+                        score = self.last_score  # Maintain previous score
+                    else:
+                        # Small decrease - might be correct (e.g., after crash)
+                        pass
+                        
+                # Check for consecutive identical scores
+                if score == self.last_score:
+                    self.consecutive_identical_scores += 1
+                    if self.consecutive_identical_scores > 20:  # If score hasn't changed for many frames
+                        # Introduce small increment to show progress
+                        score = self.last_score + 1
+                        self.consecutive_identical_scores = 0
+                else:
+                    self.consecutive_identical_scores = 0
             
             # Update last score
             self.last_score = score
@@ -230,7 +275,10 @@ class ScreenCapture:
                     coins = self.last_coins + 1
                 elif coins < self.last_coins:
                     # Coins shouldn't decrease during normal gameplay
-                    coins = self.last_coins
+                    # But allow for small variations due to OCR errors
+                    if self.last_coins - coins > 2:
+                        coins = self.last_coins
+                    # else accept the small decrease
             
             # Update last coins
             self.last_coins = coins
@@ -268,37 +316,132 @@ class ScreenCapture:
             except Exception as e:
                 print(f"Error logging OCR result: {e}")
     
+    def _is_likely_play_button(self, contour, img_shape, min_area=1000):
+        """Determine if a contour is likely to be a play button"""
+        area = cv2.contourArea(contour)
+        
+        # Check area size
+        if area < min_area:
+            return False
+        
+        # Get bounding box to analyze shape
+        x, y, w, h = cv2.boundingRect(contour)
+        
+        # Calculate aspect ratio and relative position
+        aspect_ratio = float(w) / h if h > 0 else 0
+        relative_y_pos = y / img_shape[0] if img_shape[0] > 0 else 0
+        
+        # Play button criteria:
+        # 1. Should be somewhat wider than tall (typical button shape)
+        # 2. Should be in the bottom half of the screen
+        # 3. Should have a reasonable size relative to the image
+        is_button_shape = 1.5 < aspect_ratio < 5
+        is_in_bottom_half = relative_y_pos > 0.6
+        relative_size = area / (img_shape[0] * img_shape[1])
+        is_reasonable_size = 0.005 < relative_size < 0.1  # Between 0.5% and 10% of screen
+        
+        return is_button_shape and is_in_bottom_half and is_reasonable_size
+    
+    def _calculate_symmetry(self, mask, x, y, w, h):
+        """Calculate horizontal symmetry of a potential button region"""
+        if w < 10 or h < 10:  # Too small to check symmetry
+            return 0
+            
+        # Extract region of interest
+        roi = mask[y:y+h, x:x+w]
+        
+        # Split into left and right halves
+        mid = w // 2
+        left_half = roi[:, :mid]
+        right_half = roi[:, mid:2*mid] if 2*mid <= w else roi[:, mid:]
+        
+        # If right half is wider, crop it
+        if right_half.shape[1] > left_half.shape[1]:
+            right_half = right_half[:, :left_half.shape[1]]
+            
+        # If right half is narrower, pad it
+        elif right_half.shape[1] < left_half.shape[1]:
+            pad_width = left_half.shape[1] - right_half.shape[1]
+            right_half = np.pad(right_half, ((0, 0), (0, pad_width)), 'constant')
+        
+        # Flip right half horizontally
+        right_half_flipped = cv2.flip(right_half, 1)
+        
+        # Calculate similarity (intersection over union)
+        intersection = np.logical_and(left_half, right_half_flipped).sum()
+        union = np.logical_or(left_half, right_half_flipped).sum()
+        
+        if union == 0:
+            return 0
+            
+        return intersection / union
+    
     def detect_game_over(self):
-        """Detect if the game is over using multiple methods"""
+        """Improved game over detection with stability checks"""
+        # Throttle game over checks to avoid overloading
+        current_time = time.time()
+        if current_time - self.last_game_over_check_time < 0.5:  # Only check every 0.5 seconds
+            return False
+        
+        self.last_game_over_check_time = current_time
+        
         try:
             game_img = self.capture_game_screen()
             
-            # Convert to numpy array if needed
-            if isinstance(game_img, Image.Image):
-                img_array = np.array(game_img)
-            else:
-                img_array = game_img.copy()
-            
-            # Game over detection method 1: Find the play button
-            if self.locate_play_button() is not None:
-                print("Play button found - game is likely over")
-                self.save_screenshot(img_array, "game_over", f"game_over_play_button")
-                return True
-            
-            # Game over detection method 2: Check for specific green button at bottom
-            if len(img_array.shape) == 3 and img_array.shape[2] == 3:
-                hsv = cv2.cvtColor(img_array, cv2.COLOR_RGB2HSV)
-                lower_green = np.array([40, 100, 100])
-                upper_green = np.array([80, 255, 255])
-                green_mask = cv2.inRange(hsv, lower_green, upper_green)
+            # Try template matching for game over text/screen
+            if 'game_over' in self.templates and self.templates['game_over'] is not None:
+                # Convert to numpy array if needed
+                if isinstance(game_img, Image.Image):
+                    img_array = np.array(game_img)
+                    if len(img_array.shape) == 3 and img_array.shape[2] == 3:
+                        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+                    else:
+                        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
+                else:
+                    img_bgr = game_img
                 
-                # Focus on bottom portion of the screen where play button usually is
-                bottom_portion = green_mask[int(green_mask.shape[0]*0.7):, :]
-                if np.sum(bottom_portion) > 5000:  # Significant green area at bottom
-                    print("Green area detected at bottom - likely play button")
-                    self.save_screenshot(img_array, "game_over", f"game_over_green_button")
-                    return True
+                # Perform template matching
+                try:
+                    result = cv2.matchTemplate(img_bgr, self.templates['game_over'], cv2.TM_CCOEFF_NORMED)
+                    _, max_val, _, _ = cv2.minMaxLoc(result)
+                    
+                    # High confidence game over detection
+                    if max_val > 0.7:
+                        self.save_screenshot(img_array, "game_over", f"game_over_template")
+                        return True
+                except Exception as e:
+                    print(f"Error in template matching: {e}")
             
+            # Check for play button
+            play_button_loc = self.locate_play_button()
+            if play_button_loc is not None:
+                # If we've detected the play button in the same location multiple times
+                if (self.last_known_play_button is not None and 
+                    abs(play_button_loc[0] - self.last_known_play_button[0]) < 10 and
+                    abs(play_button_loc[1] - self.last_known_play_button[1]) < 10):
+                    
+                    self.consecutive_play_button_detections += 1
+                    
+                    # Only consider game over if we've seen the play button multiple times
+                    if self.consecutive_play_button_detections >= 3:
+                        self.save_screenshot(game_img, "game_over", f"game_over_play_button")
+                        return True
+                else:
+                    # Reset counter for new position
+                    self.consecutive_play_button_detections = 1
+                    
+                self.last_known_play_button = play_button_loc
+            else:
+                # Reset counter if no play button detected
+                self.consecutive_play_button_detections = 0
+                self.last_known_play_button = None
+            
+            # Check for static score as a sign of game over
+            # If score hasn't changed for a long time, it might indicate game over
+            if self.consecutive_identical_scores > 30:  # If score hasn't changed for 30 frames
+                self.save_screenshot(game_img, "game_over", f"game_over_static_score")
+                return True
+                
             return False
             
         except Exception as e:
@@ -306,7 +449,7 @@ class ScreenCapture:
             return False
     
     def locate_play_button(self):
-        """Locate the play button on the game over screen"""
+        """Improved locate play button function with more robust detection"""
         try:
             game_img = self.capture_game_screen()
             
@@ -316,31 +459,47 @@ class ScreenCapture:
             else:
                 img_array = game_img.copy()
             
-            # Method 1: Template matching
+            # METHOD 1: Template matching
             if 'play_button' in self.templates and self.templates['play_button'] is not None:
-                if len(img_array.shape) == 3 and img_array.shape[2] == 3:
-                    img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-                else:
-                    img_bgr = cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
+                try:
+                    if len(img_array.shape) == 3 and img_array.shape[2] == 3:
+                        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+                    else:
+                        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
+                        
+                    result = cv2.matchTemplate(img_bgr, self.templates['play_button'], cv2.TM_CCOEFF_NORMED)
+                    _, max_val, _, max_loc = cv2.minMaxLoc(result)
                     
-                result = cv2.matchTemplate(img_bgr, self.templates['play_button'], cv2.TM_CCOEFF_NORMED)
-                _, max_val, _, max_loc = cv2.minMaxLoc(result)
-                
-                if max_val > 0.5:  # Lower threshold for better detection
-                    # Get the center of the play button
-                    h, w = self.templates['play_button'].shape[:2]
-                    center_x = max_loc[0] + w // 2 + GAME_REGION[0]
-                    center_y = max_loc[1] + h // 2 + GAME_REGION[1]
-                    
-                    print(f"Play button found at ({center_x}, {center_y}) with confidence {max_val:.2f}")
-                    return (center_x, center_y)
+                    if max_val > 0.7:  # Higher threshold for better reliability
+                        # Get the center of the play button
+                        h, w = self.templates['play_button'].shape[:2]
+                        center_x = max_loc[0] + w // 2 + GAME_REGION[0]
+                        center_y = max_loc[1] + h // 2 + GAME_REGION[1]
+                        
+                        return (center_x, center_y)
+                except Exception as e:
+                    print(f"Error in template matching: {e}")
             
-            # Method 2: Color detection for green play button
+            # METHOD 2: Color detection for green play button
             if len(img_array.shape) == 3 and img_array.shape[2] == 3:
+                # Convert to HSV for better color detection
                 hsv = cv2.cvtColor(img_array, cv2.COLOR_RGB2HSV)
-                lower_green = np.array([40, 100, 100])
-                upper_green = np.array([80, 255, 255])
+                
+                # More specific green color range for the play button
+                lower_green = np.array([45, 120, 120])  # More specific green
+                upper_green = np.array([75, 255, 255])  # More specific green
+                
+                # Create a mask for green areas
                 green_mask = cv2.inRange(hsv, lower_green, upper_green)
+                
+                # Apply morphology to clean the mask
+                kernel = np.ones((5, 5), np.uint8)
+                green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
+                green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel)
+                
+                # Check if we have sufficient green pixels
+                if np.sum(green_mask) < 5000:  # Minimum number of green pixels
+                    return None
                 
                 # Find contours of green areas
                 contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -350,30 +509,21 @@ class ScreenCapture:
                     contours = sorted(contours, key=cv2.contourArea, reverse=True)
                     
                     for contour in contours:
-                        area = cv2.contourArea(contour)
-                        if area > 1000:  # Min area threshold
-                            # Get bounding box
+                        # Check if contour is likely a play button using multiple criteria
+                        if self._is_likely_play_button(contour, img_array.shape[:2]):
+                            # Get bounding box and center point
                             x, y, w, h = cv2.boundingRect(contour)
                             
-                            # Check if in bottom half of screen (play button location)
-                            if y > img_array.shape[0] * 0.5:
-                                center_x = x + w // 2 + GAME_REGION[0]
-                                center_y = y + h // 2 + GAME_REGION[1]
-                                print(f"Play button found using color detection at ({center_x}, {center_y})")
+                            # Additional validation: check for symmetry typical of buttons
+                            symmetry_score = self._calculate_symmetry(green_mask, x, y, w, h)
+                            if symmetry_score > 0.7:  # High symmetry requirement
+                                center_x = x + w//2 + GAME_REGION[0]
+                                center_y = y + h//2 + GAME_REGION[1]
                                 return (center_x, center_y)
             
-            # Method 3: Use hardcoded play button position
-            play_button_x = GAME_REGION[0] + GAME_REGION[2] // 2
-            play_button_y = GAME_REGION[1] + GAME_REGION[3] - 60
-            
-            # Check if the position has a green color (play button)
-            pixel_color = pyautogui.pixel(play_button_x, play_button_y)
-            
-            # If pixel has green component, it might be the play button
-            if pixel_color[1] > 100 and pixel_color[1] > pixel_color[0] and pixel_color[1] > pixel_color[2]:
-                print(f"Play button found at hardcoded position ({play_button_x}, {play_button_y})")
-                return (play_button_x, play_button_y)
-            
+            # METHOD 3: Only use fallback if needed for user-initiated restart
+            # Avoid using the fallback for automatic game over detection
+            # as it can lead to false positives
             return None
             
         except Exception as e:

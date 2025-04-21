@@ -1,4 +1,4 @@
-# Improved game_control.py with swipe mechanics
+# Improved game_control.py with better swipe mechanics and game state detection
 import os
 import time
 import subprocess
@@ -14,7 +14,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from subway_ai.config import *
 
 class GameControl:
-    """Handles game control for Subway Surfers AI"""
+    """Handles game control for Subway Surfers AI with improved stability"""
     
     def __init__(self):
         # Initialize pyautogui settings
@@ -41,7 +41,13 @@ class GameControl:
         # Game state tracking
         self.game_running = False
         self.last_action_time = time.time()
-        self.action_cooldown = 0.2  # Cooldown between actions
+        self.action_cooldown = 0.25  # Increased cooldown between actions for stability
+        self.last_restart_time = 0
+        self.restart_cooldown = 5.0  # Seconds to wait between restart attempts
+        
+        # Consecutive detection counters for stability
+        self.consecutive_play_button_detections = 0
+        self.last_known_play_button = None
         
         # Recording
         self.recording = False
@@ -100,9 +106,15 @@ class GameControl:
             game_img = pyautogui.screenshot(region=GAME_REGION)
             # Convert to numpy array and check if it's not all black
             img_array = np.array(game_img)
-            if img_array.mean() > 10:  # If average pixel value is greater than 10, game is likely running
-                self.game_running = True
-                return True
+            
+            # More sophisticated check - look for non-black areas and color variation
+            if img_array.mean() > 20 and img_array.std() > 30:  # Higher thresholds
+                # Check for content variation (not just a solid color)
+                channels_std = [img_array[:,:,i].std() for i in range(3)]
+                if all(std > 20 for std in channels_std):  # Ensure variation in all color channels
+                    self.game_running = True
+                    return True
+            
             self.game_running = False
             return False
         except Exception as e:
@@ -118,14 +130,18 @@ class GameControl:
                 subprocess.Popen([GAME_PATH])
                 print(f"Starting game from {GAME_PATH}")
                 
-                # Wait for the game to load
-                time.sleep(5)
+                # Wait for the game to load - increased wait time
+                for i in range(10):
+                    print(f"Waiting for game to load... {i+1}/10")
+                    time.sleep(1)
+                    if self.check_game_running():
+                        break
                 
                 # Make sure the window is in focus
                 self.focus_game_window()
                 
                 # Wait a bit more for the game to stabilize
-                time.sleep(2)
+                time.sleep(3)
                 
                 # Start recording gameplay
                 self.start_recording()
@@ -146,139 +162,300 @@ class GameControl:
         """Focus on the game window by clicking in the center of the game region"""
         center_x = GAME_REGION[0] + GAME_REGION[2] // 2
         center_y = GAME_REGION[1] + GAME_REGION[3] // 2
+        
+        # Move mouse first to avoid accidental drags
+        pyautogui.moveTo(center_x, center_y)
+        time.sleep(0.2)  # Short pause
         pyautogui.click(center_x, center_y)
         time.sleep(0.5)
         print(f"Focusing game window by clicking at ({center_x}, {center_y})")
     
+    def _is_likely_play_button(self, contour, img_shape, min_area=1000):
+        """Determine if a contour is likely to be a play button based on shape and position"""
+        area = cv2.contourArea(contour)
+        
+        # Check area size
+        if area < min_area:
+            return False
+        
+        # Get bounding box to analyze shape
+        x, y, w, h = cv2.boundingRect(contour)
+        
+        # Calculate aspect ratio and relative position
+        aspect_ratio = float(w) / h if h > 0 else 0
+        relative_y_pos = y / img_shape[0] if img_shape[0] > 0 else 0
+        
+        # Play button criteria:
+        # 1. Should be somewhat wider than tall (typical button shape)
+        # 2. Should be in the bottom half of the screen
+        # 3. Should have a reasonable size relative to the image
+        is_button_shape = 1.5 < aspect_ratio < 5
+        is_in_bottom_half = relative_y_pos > 0.6
+        relative_size = area / (img_shape[0] * img_shape[1])
+        is_reasonable_size = 0.005 < relative_size < 0.1  # Between 0.5% and 10% of screen
+        
+        return is_button_shape and is_in_bottom_half and is_reasonable_size
+    
+    def _calculate_symmetry(self, mask, x, y, w, h):
+        """Calculate horizontal symmetry of a potential button region"""
+        if w < 10 or h < 10:  # Too small to check symmetry
+            return 0
+            
+        # Extract region of interest
+        roi = mask[y:y+h, x:x+w]
+        
+        # Split into left and right halves
+        mid = w // 2
+        left_half = roi[:, :mid]
+        right_half = roi[:, mid:2*mid] if 2*mid <= w else roi[:, mid:]
+        
+        # If right half is wider, crop it
+        if right_half.shape[1] > left_half.shape[1]:
+            right_half = right_half[:, :left_half.shape[1]]
+            
+        # If right half is narrower, pad it
+        elif right_half.shape[1] < left_half.shape[1]:
+            pad_width = left_half.shape[1] - right_half.shape[1]
+            right_half = np.pad(right_half, ((0, 0), (0, pad_width)), 'constant')
+        
+        # Flip right half horizontally
+        right_half_flipped = cv2.flip(right_half, 1)
+        
+        # Calculate similarity (intersection over union)
+        intersection = np.logical_and(left_half, right_half_flipped).sum()
+        union = np.logical_or(left_half, right_half_flipped).sum()
+        
+        if union == 0:
+            return 0
+            
+        return intersection / union
+    
     def detect_game_over(self):
-        """Detect if the game is over using template matching or by finding the play button"""
+        """Improved detect game over function with multiple detection methods"""
         # Take a screenshot of the game region
         game_img = pyautogui.screenshot(region=GAME_REGION)
         game_img_np = np.array(game_img)
         game_img_cv = cv2.cvtColor(game_img_np, cv2.COLOR_RGB2BGR)
         
-        # Method 1: Check for play button (usually visible on game over screen)
-        play_button_loc = self.find_play_button()
+        # METHOD 1: Template matching for game over screen
+        if self.game_over_template is not None:
+            try:
+                result = cv2.matchTemplate(game_img_cv, self.game_over_template, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, _ = cv2.minMaxLoc(result)
+                
+                if max_val > 0.7:  # Higher threshold for more confidence
+                    print(f"Game over screen detected with confidence {max_val:.2f}")
+                    return True
+            except Exception as e:
+                print(f"Error in template matching: {e}")
+        
+        # METHOD 2: Find the play button using improved detection
+        play_button_loc = self.find_play_button(game_img_np)
         if play_button_loc is not None:
-            print("Play button found - game is likely over")
-            return True
-            
-        # Method 2: Check for specific colors or patterns on game over screen
-        # Convert to HSV for better color detection
-        hsv = cv2.cvtColor(game_img_cv, cv2.COLOR_BGR2HSV)
+            # If play button detected in the same location multiple times
+            if (self.last_known_play_button is not None and 
+                abs(play_button_loc[0] - self.last_known_play_button[0]) < 10 and
+                abs(play_button_loc[1] - self.last_known_play_button[1]) < 10):
+                
+                self.consecutive_play_button_detections += 1
+                
+                # Only consider game over if we've seen the play button multiple times
+                if self.consecutive_play_button_detections >= 3:
+                    print("Play button detected consistently - game is likely over")
+                    return True
+            else:
+                # Reset counter for new position
+                self.consecutive_play_button_detections = 1
+                
+            self.last_known_play_button = play_button_loc
+        else:
+            # Reset counter if no play button detected
+            self.consecutive_play_button_detections = 0
+            self.last_known_play_button = None
         
-        # Check for green play button (common on game over screens)
-        lower_green = np.array([40, 100, 100])
-        upper_green = np.array([80, 255, 255])
-        green_mask = cv2.inRange(hsv, lower_green, upper_green)
-        
-        # If we have a significant green area at the bottom of the screen (play button)
-        bottom_half = green_mask[green_mask.shape[0]//2:, :]
-        if np.sum(bottom_half) > 10000:  # Threshold can be adjusted
-            print("Green play button detected - game is likely over")
-            return True
+        # METHOD 3: Check for specific game over indicators
+        # 1. Look for text areas that might contain "GAME OVER"
+        # Convert to grayscale
+        gray = cv2.cvtColor(game_img_cv, cv2.COLOR_BGR2GRAY)
+        # Apply threshold to find text
+        _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+        # Look for horizontal text-like structures in the upper half of the screen
+        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 1))
+        detected_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel)
+        upper_half = detected_lines[:detected_lines.shape[0]//2, :]
+        if np.sum(upper_half) > 5000:  # Significant text detected in upper half
+            # Additional check - look for vertical alignment typical of "GAME OVER" text
+            vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 15))
+            vertical_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel)
+            if np.sum(vertical_lines[:vertical_lines.shape[0]//2, :]) > 3000:
+                print("Text indicators suggest game over screen")
+                return True
         
         return False
     
-    def find_play_button(self):
+    def find_play_button(self, img=None):
         """Find the play button using multiple detection methods"""
-        # Take a screenshot of the game region
-        game_img = pyautogui.screenshot(region=GAME_REGION)
-        game_img_np = np.array(game_img)
-        game_img_cv = cv2.cvtColor(game_img_np, cv2.COLOR_RGB2BGR)
+        if img is None:
+            # Take a screenshot of the game region
+            game_img = pyautogui.screenshot(region=GAME_REGION)
+            img = np.array(game_img)
         
-        # Method 1: Template matching
+        # Convert to BGR for OpenCV if it's RGB
+        if len(img.shape) == 3 and img.shape[2] == 3:
+            img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        else:
+            # If grayscale or already BGR
+            img_bgr = img
+        
+        # METHOD 1: Template matching
         if self.play_button_template is not None:
             try:
-                result = cv2.matchTemplate(game_img_cv, self.play_button_template, cv2.TM_CCOEFF_NORMED)
+                result = cv2.matchTemplate(img_bgr, self.play_button_template, cv2.TM_CCOEFF_NORMED)
                 min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
                 
-                if max_val > 0.5:  # Lower threshold for better detection
+                if max_val > 0.7:  # Higher threshold for better reliability
                     # Get the center of the template
                     h, w = self.play_button_template.shape[:2]
                     center_x = max_loc[0] + w // 2 + GAME_REGION[0]
                     center_y = max_loc[1] + h // 2 + GAME_REGION[1]
-                    print(f"Play button found at ({center_x}, {center_y}) with confidence {max_val:.2f}")
+                    print(f"Play button found with high confidence {max_val:.2f} at ({center_x}, {center_y})")
                     return (center_x, center_y)
             except Exception as e:
                 print(f"Error in template matching: {e}")
         
-        # Method 2: Find green button using color detection
+        # METHOD 2: Enhanced color detection for green play button
         try:
             # Convert to HSV for better color detection
-            hsv = cv2.cvtColor(game_img_cv, cv2.COLOR_BGR2HSV)
+            hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
             
-            # Green color range for the play button
-            lower_green = np.array([40, 100, 100])
-            upper_green = np.array([80, 255, 255])
+            # More specific green color range for play button
+            lower_green = np.array([45, 120, 120])  # More specific green
+            upper_green = np.array([75, 255, 255])  # More specific green
+            
+            # Create a mask for green areas
             green_mask = cv2.inRange(hsv, lower_green, upper_green)
+            
+            # Apply morphology to clean the mask
+            kernel = np.ones((5, 5), np.uint8)
+            green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
+            green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel)
+            
+            # Check if we have sufficient green pixels
+            if np.sum(green_mask) < 5000:  # Minimum number of green pixels
+                return None
             
             # Find contours of green areas
             contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
-            # Analyze contours to find the play button
             if contours:
-                # Sort contours by area (largest first)
+                # Sort by area (largest first)
                 contours = sorted(contours, key=cv2.contourArea, reverse=True)
                 
                 for contour in contours:
-                    area = cv2.contourArea(contour)
-                    if area > 1000:  # Min area threshold
-                        # Get bounding box for the contour
+                    # Check if contour is likely a play button using multiple criteria
+                    if self._is_likely_play_button(contour, img.shape[:2]):
+                        # Get bounding box and center point
                         x, y, w, h = cv2.boundingRect(contour)
                         
-                        # Check if the aspect ratio is reasonable for a button
-                        aspect_ratio = float(w)/h
-                        if 1.5 < aspect_ratio < 5:  # Play button is usually wider than tall
-                            # Get the center of the contour
+                        # Additional validation: check for symmetry typical of buttons
+                        symmetry_score = self._calculate_symmetry(green_mask, x, y, w, h)
+                        if symmetry_score > 0.65:  # High symmetry requirement
                             center_x = x + w//2 + GAME_REGION[0]
                             center_y = y + h//2 + GAME_REGION[1]
+                            print(f"Play button found using enhanced color detection at ({center_x}, {center_y})")
                             
-                            # If in the bottom part of the screen, it's likely the play button
-                            if y > game_img_cv.shape[0] * 0.6:
-                                print(f"Play button found using color detection at ({center_x}, {center_y})")
-                                return (center_x, center_y)
+                            # Save button image for debugging (if needed)
+                            # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            # debug_dir = os.path.join(SCREENSHOTS_DIR, "debug")
+                            # os.makedirs(debug_dir, exist_ok=True)
+                            # cv2.imwrite(os.path.join(debug_dir, f"play_button_{timestamp}.png"), 
+                            #             img_bgr[y:y+h, x:x+w])
+                            
+                            return (center_x, center_y)
         except Exception as e:
             print(f"Error in color detection: {e}")
         
-        # Method 3: Use the specific Play button position from the screenshot
-        try:
-            # Check for the green play button in the bottom center
-            center_x = GAME_REGION[0] + GAME_REGION[2] // 2
-            center_y = GAME_REGION[1] + GAME_REGION[3] - 60  # Near bottom
-            return (center_x, center_y)
-        except Exception as e:
-            print(f"Error in fallback detection: {e}")
-            return None
+        # METHOD 3: Use hardcoded central play button position only if necessary
+        # for user-initiated restart, not for automatic detection
+        return None
     
     def restart_game(self, play_button_location=None):
-        """Restart the game after game over"""
+        """Restart the game after game over with improved reliability"""
+        current_time = time.time()
+        
+        # Enforce cooldown period between restart attempts
+        if current_time - self.last_restart_time < self.restart_cooldown:
+            print(f"Waiting for restart cooldown ({self.restart_cooldown - (current_time - self.last_restart_time):.1f}s left)")
+            return False
+        
+        self.last_restart_time = current_time
+        
+        # First ensure the game window is focused
+        self.focus_game_window()
+        time.sleep(0.5)  # Short pause after focusing
+        
+        # Try different methods to find and click the play button
         if not play_button_location:
             # Try to find the play button
             play_button_location = self.find_play_button()
         
-        # Click the play button
+        # Click the play button if found
         if play_button_location:
-            pyautogui.click(play_button_location[0], play_button_location[1])
+            # Move mouse first, then click
+            pyautogui.moveTo(play_button_location[0], play_button_location[1])
+            time.sleep(0.3)  # Short pause
+            pyautogui.click()
             print(f"Clicked play button at {play_button_location}")
-            time.sleep(1)  # Wait for the click to register
+            time.sleep(1.5)  # Longer wait for the click to register
             
             # Increment total games counter
             self.stats['total_games'] += 1
             print(f"Total games played: {self.stats['total_games']}")
             
+            # Clear any cached button positions
+            self.last_known_play_button = None
+            self.consecutive_play_button_detections = 0
+            
             self.game_running = True
             return True
-        else:
-            print("Failed to find play button")
-            return False
+        
+        # If no play button found, try clicking in common locations
+        common_positions = [
+            (GAME_REGION[0] + GAME_REGION[2] // 2, GAME_REGION[1] + GAME_REGION[3] - 100),  # Bottom center
+            (GAME_REGION[0] + GAME_REGION[2] // 2, GAME_REGION[1] + GAME_REGION[3] - 150),  # Slightly above bottom center
+            (GAME_REGION[0] + GAME_REGION[2] // 2, GAME_REGION[1] + GAME_REGION[3] // 2 + 100)  # Below center
+        ]
+        
+        for pos in common_positions:
+            # Check if the position has green color (possible play button)
+            try:
+                pixel_color = pyautogui.pixel(pos[0], pos[1])
+                # If pixel has strong green component
+                if pixel_color[1] > 120 and pixel_color[1] > pixel_color[0] * 1.5 and pixel_color[1] > pixel_color[2] * 1.5:
+                    print(f"Clicking likely play button at {pos}")
+                    pyautogui.click(pos[0], pos[1])
+                    time.sleep(1.5)
+                    
+                    # Increment total games counter
+                    self.stats['total_games'] += 1
+                    print(f"Total games played: {self.stats['total_games']}")
+                    
+                    self.game_running = True
+                    return True
+            except Exception as e:
+                print(f"Error checking pixel at {pos}: {e}")
+        
+        print("Failed to find play button")
+        return False
     
     def perform_action(self, action):
-        """Perform action using swipe gestures instead of keyboard controls"""
+        """Improved action performance with more controlled swipe gestures"""
         # Check cooldown to prevent too many actions too quickly
         current_time = time.time()
         if current_time - self.last_action_time < self.action_cooldown:
-            return "COOLDOWN"
+            # Still in cooldown
+            time.sleep(self.action_cooldown - (current_time - self.last_action_time))
+            current_time = time.time()  # Update after wait
         
         # Get action name
         action_name = ACTIONS.get(action, "NONE")
@@ -291,38 +468,60 @@ class GameControl:
         swipe_distance_x = GAME_REGION[2] // 4
         swipe_distance_y = GAME_REGION[3] // 4
         
-        # Perform swipe action based on the action name
-        if action_name == "LEFT":
-            # Swipe from center to left
-            pyautogui.moveTo(center_x, center_y)
-            pyautogui.mouseDown(button='left')
-            pyautogui.moveTo(center_x - swipe_distance_x, center_y, duration=0.1)
-            pyautogui.mouseUp(button='left')
-        elif action_name == "RIGHT":
-            # Swipe from center to right
-            pyautogui.moveTo(center_x, center_y)
-            pyautogui.mouseDown(button='left')
-            pyautogui.moveTo(center_x + swipe_distance_x, center_y, duration=0.1)
-            pyautogui.mouseUp(button='left')
-        elif action_name == "UP":
-            # Swipe from center to up (jump)
-            pyautogui.moveTo(center_x, center_y)
-            pyautogui.mouseDown(button='left')
-            pyautogui.moveTo(center_x, center_y - swipe_distance_y, duration=0.1)
-            pyautogui.mouseUp(button='left')
-        elif action_name == "DOWN":
-            # Swipe from center to down (roll)
-            pyautogui.moveTo(center_x, center_y)
-            pyautogui.mouseDown(button='left')
-            pyautogui.moveTo(center_x, center_y + swipe_distance_y, duration=0.1)
-            pyautogui.mouseUp(button='left')
-        # For NONE action, do nothing
+        # Swipe duration (slower for more reliable detection)
+        swipe_duration = 0.15
+        
+        try:
+            # Perform swipe action based on the action name
+            if action_name == "LEFT":
+                # Swipe from center to left
+                pyautogui.moveTo(center_x, center_y)
+                time.sleep(0.05)  # Short pause before mouseDown
+                pyautogui.mouseDown(button='left')
+                pyautogui.moveTo(center_x - swipe_distance_x, center_y, duration=swipe_duration)
+                pyautogui.mouseUp(button='left')
+                # Return to center
+                pyautogui.moveTo(center_x, center_y)
+            elif action_name == "RIGHT":
+                # Swipe from center to right
+                pyautogui.moveTo(center_x, center_y)
+                time.sleep(0.05)
+                pyautogui.mouseDown(button='left')
+                pyautogui.moveTo(center_x + swipe_distance_x, center_y, duration=swipe_duration)
+                pyautogui.mouseUp(button='left')
+                # Return to center
+                pyautogui.moveTo(center_x, center_y)
+            elif action_name == "UP":
+                # Swipe from center to up (jump)
+                pyautogui.moveTo(center_x, center_y)
+                time.sleep(0.05)
+                pyautogui.mouseDown(button='left')
+                pyautogui.moveTo(center_x, center_y - swipe_distance_y, duration=swipe_duration)
+                pyautogui.mouseUp(button='left')
+                # Return to center
+                pyautogui.moveTo(center_x, center_y)
+            elif action_name == "DOWN":
+                # Swipe from center to down (roll)
+                pyautogui.moveTo(center_x, center_y)
+                time.sleep(0.05)
+                pyautogui.mouseDown(button='left')
+                pyautogui.moveTo(center_x, center_y + swipe_distance_y, duration=swipe_duration)
+                pyautogui.mouseUp(button='left')
+                # Return to center
+                pyautogui.moveTo(center_x, center_y)
+            # For NONE action, do nothing but return to center
+            else:
+                # Just move to center, no click or drag
+                pyautogui.moveTo(center_x, center_y)
+                time.sleep(swipe_duration)  # Still pause to maintain timing
+        except Exception as e:
+            print(f"Error performing action {action_name}: {e}")
         
         # Print the action for debugging
         if action_name != "NONE":
             print(f"Performed swipe action: {action_name}")
         
-        self.last_action_time = current_time
+        self.last_action_time = time.time()
         
         # Update stats
         self.stats['total_steps'] += 1
@@ -382,14 +581,18 @@ class GameControl:
         if not self.recording or self.video_writer is None:
             return False
         
-        # Capture the game screen
-        game_img = pyautogui.screenshot(region=GAME_REGION)
-        frame = np.array(game_img)
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        
-        # Write the frame to the video
-        self.video_writer.write(frame)
-        return True
+        try:
+            # Capture the game screen
+            game_img = pyautogui.screenshot(region=GAME_REGION)
+            frame = np.array(game_img)
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            
+            # Write the frame to the video
+            self.video_writer.write(frame)
+            return True
+        except Exception as e:
+            print(f"Error recording frame: {e}")
+            return False
     
     def update_stats(self, score, coins, reward, epsilon):
         """Update and display real-time training statistics"""
@@ -402,18 +605,7 @@ class GameControl:
         # Update current stats
         self.stats['total_rewards'] += reward
         self.stats['current_epsilon'] = epsilon
-        
-        # Display real-time stats
-        print(f"\n{'=' * 40}")
-        print(f"TRAINING STATS:")
-        print(f"{'=' * 40}")
-        print(f"Total Games: {self.stats['total_games']}")
-        print(f"Total Steps: {self.stats['total_steps']}")
-        print(f"Highest Score: {self.stats['highest_score']}")
-        print(f"Highest Coins: {self.stats['highest_coins']}")
-        print(f"Total Rewards: {self.stats['total_rewards']:.2f}")
-        print(f"Current Epsilon: {self.stats['current_epsilon']:.4f}")
-        print(f"Current Score: {score}")
-        print(f"Current Coins: {coins}")
-        print(f"Last Reward: {reward:.2f}")
-        print(f"{'=' * 40}\n")
+
+        # Display stats
+        print(f"Score: {score}, Coins: {coins}, Reward: {reward:.2f}, Epsilon: {epsilon:.2f}")
+        print(f"Highest Score: {self.stats['highest_score']}, Highest Coins: {self.stats['highest_coins']}")
