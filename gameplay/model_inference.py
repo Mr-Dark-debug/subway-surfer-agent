@@ -14,7 +14,9 @@ import torch.nn.functional as F
 import subprocess
 from datetime import datetime
 import argparse
-
+from config import *
+import webbrowser
+import glob
 # Check if CUDA is available
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -68,49 +70,51 @@ class GameStateDetector:
         except Exception as e:
             print(f"Warning: Could not load template images: {e}")
     
-    def detect_game_over(self, game_img):
-        """Detect if the game is over based on image analysis"""
-        img_array = np.array(game_img)
+    def detect_game_over(self):
+        """Detect if the game is over using multiple methods"""
+        # 1. Template matching
+        template_match_result = self._detect_game_over_template()
+        if template_match_result:
+            return True
         
-        # Check for 'Save me!' screen
-        if self.save_me_template is not None:
-            img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-            result = cv2.matchTemplate(img_bgr, self.save_me_template, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, _ = cv2.minMaxLoc(result)
-            if max_val > 0.7:
-                return True, "save_me"
+        # 2. Check for play button presence
+        play_button_loc = self.find_play_button()
+        if play_button_loc:
+            return True
         
-        # Check for score screen
-        if self.score_screen_template is not None:
-            img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-            result = cv2.matchTemplate(img_bgr, self.score_screen_template, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, _ = cv2.minMaxLoc(result)
-            if max_val > 0.7:
-                return True, "score_screen"
+        # 3. Check for specific colors or patterns
+        game_img = pyautogui.screenshot(region=GAME_REGION)
+        game_img_np = np.array(game_img)
         
-        # Fallback detection
-        # Look for "PLAY" button (green)
-        img_hsv = cv2.cvtColor(img_array, cv2.COLOR_RGB2HSV)
-        lower_green = np.array([40, 100, 100])
-        upper_green = np.array([80, 255, 255])
-        green_mask = cv2.inRange(img_hsv, lower_green, upper_green)
+        # Look for the darkened overlay that appears when game is over
+        # (adjust these values based on your game's appearance)
+        hsv = cv2.cvtColor(game_img_np, cv2.COLOR_RGB2HSV)
+        dark_mask = cv2.inRange(hsv, (0, 0, 0), (180, 255, 60))
+        dark_percentage = np.count_nonzero(dark_mask) / (dark_mask.shape[0] * dark_mask.shape[1])
         
-        # Look for blue "Score" text
-        lower_blue = np.array([100, 150, 150])
-        upper_blue = np.array([130, 255, 255])
-        blue_mask = cv2.inRange(img_hsv, lower_blue, upper_blue)
+        if dark_percentage > 0.5:  # If more than 50% of screen is dark
+            print(f"Game over detected (dark overlay: {dark_percentage:.2f})")
+            return True
         
-        # Check if both colors exist in expected regions
-        if (np.sum(green_mask[450:550, 450:650]) > 5000 and 
-            np.sum(blue_mask[100:200, 400:600]) > 5000):
-            return True, "score_screen"
+        return False
+
+    def _detect_game_over_template(self):
+        """Detect game over using template matching"""
+        if self.game_over_template is None:
+            return False
         
-        # Look for blue "Save me!" text
-        center_region = blue_mask[150:250, 400:600]
-        if np.sum(center_region) > 10000:
-            return True, "save_me"
-            
-        return False, None
+        game_img = pyautogui.screenshot(region=GAME_REGION)
+        game_img_np = np.array(game_img)
+        game_img_cv = cv2.cvtColor(game_img_np, cv2.COLOR_RGB2BGR)
+        
+        result = cv2.matchTemplate(game_img_cv, self.game_over_template, cv2.TM_CCOEFF_NORMED)
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+        
+        if max_val > 0.6:  # Adjust threshold as needed
+            print(f"Game over detected (template matching: {max_val:.2f})")
+            return True
+        
+        return False
     
     def handle_game_over(self, game_over_type, game_region):
         """Handle the game over state based on the type detected"""
@@ -197,7 +201,7 @@ def open_browser_incognito(url):
         
     # Final fallback to system default browser (may not be incognito)
     print("Using default browser (incognito mode not guaranteed)")
-    import webbrowser
+    
     webbrowser.open(url)
 
 def position_window_right_side(screen_width, screen_height):
