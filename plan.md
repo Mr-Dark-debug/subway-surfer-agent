@@ -17,13 +17,17 @@ This project aims to train a reinforcement learning model to play Subway Surfers
 ### 1. **Environment Setup**
 
 #### 1.1 **Game Interaction Setup**
-- [ ] **Use PyAutoGUI** to simulate key presses (swipes, jumps, etc.).
+- [ ] **Use PyAutoGUI** to simulate key presses (swipes, jumps, etc.) and restart actions.
 - [ ] **Use Selenium** or **PyAutoGUI** to capture game screen frames.
 - [ ] Create a Python script to interact with the browser window and start the game.
+- [ ] Implement **Game Over detection** (using YOLOv5 or image matching).
+- [ ] Implement **automatic game restart** logic.
 
 #### 1.2 **Game State Representation**
 - [ ] Capture the game screen and convert it into a usable state for the model (e.g., grayscale image).
 - [ ] Ensure proper frame resizing and normalization for the model’s input.
+- [ ] **Use YOLOv5** to detect locations of score, coins, and potentially obstacles/game over elements.
+- [ ] **Use OCR** (e.g., Tesseract) to extract numerical score and coin count from detected regions.
 
 #### 1.3 **Game Control Interface**
 - [ ] Map game controls (up, down, left, right, jump) to actions in the model.
@@ -124,7 +128,10 @@ This project aims to train a reinforcement learning model to play Subway Surfers
 - [ ] **NumPy** for numerical operations and data handling.
 - [ ] **PyAutoGUI** or **Selenium** for browser-based game interaction.
 - [ ] **Matplotlib** for performance plotting.
-- [ ] **Gym** for creating RL environments.
+- [ ] **Gym** for creating RL environments (optional, can build custom env).
+- [ ] **OpenCV (cv2)** for image processing (resizing, grayscale, cropping, template matching).
+- [ ] **YOLOv5** (via Ultralytics package) for object detection.
+- [ ] **Pytesseract** (and Tesseract OCR engine) for reading text from images.
 
 #### 6.2 **Utilities**
 - [ ] **Frame Preprocessing**: Implement preprocessing steps like resizing, grayscale conversion, and normalization of game frames.
@@ -182,8 +189,14 @@ This project aims to train a reinforcement learning model to play Subway Surfers
 ### 9. **To-Do List**
 
 - [ ] **Set up the environment** and interaction scripts.
+- [ ] **Capture and label data** for YOLOv5 (score area, coin area, game over elements).
+- [ ] **Train YOLOv5 model** on custom data.
+- [ ] **Implement YOLOv5 inference** in the game loop.
+- [ ] **Implement OCR** to read score/coins from detected areas.
+- [ ] **Implement Game Over detection and restart logic**.
 - [ ] **Implement DQN model** with CNN layers.
 - [ ] **Build Experience Replay buffer**.
+- [ ] **Define reward function** incorporating score, coins, survival time, and game over penalty.
 - [ ] **Train the agent** and log performance.
 - [ ] **Evaluate performance** and adjust the reward function.
 - [ ] **Tune hyperparameters** and continuously improve the model.
